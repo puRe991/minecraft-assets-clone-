@@ -53,8 +53,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | # | Module | Status |
 |---|--------|--------|
 | 1 | Foundation: math (`Vec3`) + noise (`Perlin`, `fBm`) | ✅ done, tested |
-| 2 | Block registry (hardness, tool tier, transparency, light, fluid, gravity) | ⏳ next |
-| 3 | Chunk & world storage (infinite streaming) | ⏳ |
+| 2 | Block registry (hardness, tool tier, transparency, light, fluid, gravity) | ✅ done, tested |
+| 3 | Chunk & world storage (infinite streaming) | ⏳ next |
 | 4 | Terrain: biomes, caves & ravines, rivers/oceans, ores, vegetation, structures | ⏳ |
 | 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ⏳ |
 | 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ |
@@ -81,3 +81,23 @@ key hash maps.
 Tests cover determinism per seed, the zero-at-lattice property, output range,
 continuity (no discontinuities), fBm reproducibility and added detail — plus
 full `Vec3` arithmetic/geometry/hashing. All green.
+
+## Module 2 — Block registry (done)
+
+**`vg::world::BlockType`** — a value object describing a block: hardness,
+preferred tool + harvest tier + whether a tool is *required* to drop,
+light opacity/emission, and physics flags (`solid`, `fluid`, `gravity`,
+`replaceable`) plus a `RenderLayer`. `computeMining()` turns a block + the
+tool in hand into a break time and a "will it drop?" verdict (unbreakable,
+correct-tool speed-up, tier gating for ores, hand-mineable blocks still drop).
+
+**`vg::world::BlockRegistry`** — the single source of truth: dense id→type
+lookup, unknown ids resolve to air (total lookups), and `registerDefaultBlocks`
+adds the standard set (air, stone, dirt, grass, sand/gravel with gravity,
+bedrock unbreakable, logs/planks/leaves/glass, water/lava fluids, coal/iron/
+gold/diamond ores with tier gates, and a light-emitting torch). Adding blocks
+never touches existing code (Open/Closed).
+
+Tests cover registration/density, air fallback, physics/light/render flags,
+and the full mining matrix (unbreakable, tool speed-up, tier gating, hand
+drops). All green.
