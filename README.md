@@ -20,6 +20,14 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
 
 ## Features
 
+- **Main menu** with a rotating world panorama, keyboard + mouse navigation
+- **Create-world screen with seeds** — type a seed (number or text) like in
+  Minecraft; blank = random
+- **In-game console** (`T` or `/`) with commands: `tp`, `give`, `setblock`,
+  `fill`, `time`, `gamemode`, `fly`, `speed`, `fov`, `regen`, `seed`, `help`, …
+- **Settings screen** — FOV, render distance, mouse sensitivity, move speed,
+  and daylight, all adjustable live
+- **Day / night** lighting
 - **Loads real Minecraft-format assets** — reads block textures from a
   standard resource-pack layout (`assets/minecraft/textures/block/*.png`) via
   a self-contained PNG decoder, and builds the world from them
@@ -64,12 +72,36 @@ procedurally generated texture for that block, so it always runs.
 | Left mouse | Break block |
 | Right mouse | Place block |
 | `1`–`9`, `0` | Select block to place (hotbar) |
+| `T` or `/` | Open the console |
 | `K` / `L` | Save / load the world (`world.sav`) |
 | `R` | Regenerate the world |
-| `Esc` | Quit |
+| `Esc` | Pause menu (in game) / back (in menus) |
+| Arrows + `Enter` | Navigate menus (mouse click also works) |
 
 A saved world (`world.sav`) is written next to the game and is loaded
 automatically on the next launch.
+
+### Console commands
+
+Open with `T` or `/`, type a command, press `Enter`:
+
+```
+help                       list commands
+seed                       show the current world seed
+time day|night|<0..1>      set the time of day
+tp <x> <y> <z>             teleport
+give <block>               select a block (name or id)
+setblock <x> <y> <z> <b>   place a block
+fill <x1 y1 z1 x2 y2 z2> <b>  fill a region
+gamemode creative|survival creative = fly
+fly                        toggle fly
+speed <n>                  movement-speed multiplier
+fov <n> / regen [seed]     change FOV / regenerate the world
+clear                      clear the console
+```
+
+Block names: `grass dirt stone cobblestone log leaves sand planks water glass`
+(or their numeric ids).
 
 ## Building from source
 
