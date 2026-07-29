@@ -57,8 +57,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 3 | Chunk & world storage (infinite streaming) | ✅ done, tested |
 | 4 | Terrain: biomes, caves, rivers/oceans, ores, vegetation, structures | ✅ done, tested |
 | 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ✅ done, tested |
-| 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ next |
-| 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ |
+| 6 | Rendering foundation: lighting (sky/block flood-fill) + greedy meshing | ✅ done, tested |
+| 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ next |
 | 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ |
 | 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ |
 | 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ |
@@ -165,3 +165,25 @@ coupling). Supports:
 Tests: gravity settling, walking + wall stop, sprint > walk, jump rise+land,
 swimming slows the fall, ladder climbing, and sneak-doesn't-fall (vs. walking
 which does). All green; cross-compiles win32/win64.
+
+## Module 6 — Rendering foundation: lighting + greedy meshing (done)
+
+The two algorithmic, headless-testable cores of the renderer. (The actual
+window/rasterizer is platform code and lands in a later app module.)
+
+**`vg::render::LightEngine`** — per-chunk lighting with two channels:
+- **Skylight** cast straight down each column (dimming through translucent
+  blocks) then flooded sideways with a BFS that loses one level per step, so
+  light bleeds under overhangs — the basis for smooth lighting.
+- **Block light** flooded the same way from every emitter (torch = 14,
+  lava = 15). `combined()` mixes them with a day/night factor.
+
+**`vg::render::Mesher`** — greedy meshing: emits only *exposed* faces (a face
+is skipped when the neighbour fully occludes it) and merges coplanar same-block
+faces into the largest rectangles. A solid cube becomes 6 quads instead of
+6·N² ; two adjacent blocks become 6 quads (area 10) with no interior faces.
+
+Tests: skylight full/blocked/bleeding, torch falloff, range clamping; single
+block = 6 faces, cube merges to 6 quads, no interior faces, transparent
+neighbours don't occlude, full layer merges. All green; cross-compiles
+win32/win64.
