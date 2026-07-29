@@ -90,6 +90,11 @@ void registerDefaultBlocks(BlockRegistry& reg) {
     { BlockType t = B(Ladder, "ladder");
       t.hardness = 0.4f; t.tool = ToolType::Axe; t.solid = false; t.lightOpacity = 0;
       t.climbable = true; t.layer = RenderLayer::Cutout; reg.add(t); }
+
+    // --- cobblestone (what stone drops as; smelts back into stone) ---
+    { BlockType t = B(Cobblestone, "cobblestone");
+      t.hardness = 2.0f; t.tool = ToolType::Pickaxe; t.harvestTier = Tier::Wood;
+      t.requiresTool = true; reg.add(t); }
 }
 
 }  // namespace vg::world

@@ -58,8 +58,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 4 | Terrain: biomes, caves, rivers/oceans, ores, vegetation, structures | ✅ done, tested |
 | 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ✅ done, tested |
 | 6 | Rendering foundation: lighting (sky/block flood-fill) + greedy meshing | ✅ done, tested |
-| 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ next |
-| 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ |
+| 7 | Items, inventory, crafting & smelting (stacks, durability, recipes, furnace) | ✅ done, tested |
+| 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ next |
 | 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ |
 | 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ |
 
@@ -187,3 +187,22 @@ Tests: skylight full/blocked/bleeding, torch falloff, range clamping; single
 block = 6 faces, cube merges to 6 quads, no interior faces, transparent
 neighbours don't occlude, full layer merges. All green; cross-compiles
 win32/win64.
+
+## Module 7 — Items, inventory, crafting & smelting (done)
+
+**`vg::item`** — the full item/crafting stack, all headless-testable:
+- **Items** (`ItemType`/`ItemStack`/`ItemRegistry`): stack sizes, tool class +
+  tier, durability, and `placesBlock` for block items. `damageItem` wears
+  tools down and breaks them (moving to the next in the stack).
+- **`Inventory`**: add-with-merge respecting max stack (overflow reported),
+  count, remove, and move/merge/swap between slots.
+- **`RecipeBook`**: shaped recipes (position-sensitive but translation-
+  invariant, matched via bounding-box trim) and shapeless recipes (ingredient
+  multiset). Defaults: planks←log, sticks, wood/stone/iron pickaxes, axe.
+- **`Furnace`** + `SmeltingRegistry`/`FuelRegistry`: a burn/cook state machine
+  (sand→glass, cobble→stone, iron ore→ingot; coal/log/planks/stick as fuel).
+- Module 2 gained a **Cobblestone** block (what stone drops; smelts back).
+
+Tests: registry/durability, inventory merge/overflow/remove/move, shaped +
+shapeless matching (incl. negative cases), and furnace smelting/fuel logic.
+All green; cross-compiles win32/win64.

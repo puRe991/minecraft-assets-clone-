@@ -24,7 +24,7 @@ enum : BlockId {
     OakLog, OakPlanks, OakLeaves, Glass,
     Water, Lava,
     CoalOre, IronOre, GoldOre, DiamondOre,
-    Torch, Ladder,
+    Torch, Ladder, Cobblestone,
     Count
 };
 }  // namespace blocks
