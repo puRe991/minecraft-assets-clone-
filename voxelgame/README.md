@@ -55,8 +55,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 1 | Foundation: math (`Vec3`) + noise (`Perlin`, `fBm`) | ✅ done, tested |
 | 2 | Block registry (hardness, tool tier, transparency, light, fluid, gravity) | ✅ done, tested |
 | 3 | Chunk & world storage (infinite streaming) | ✅ done, tested |
-| 4 | Terrain: biomes, caves & ravines, rivers/oceans, ores, vegetation, structures | ⏳ next |
-| 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ⏳ |
+| 4 | Terrain: biomes, caves, rivers/oceans, ores, vegetation, structures | ✅ done, tested |
+| 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ⏳ next |
 | 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ |
 | 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ |
 | 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ |
@@ -119,3 +119,29 @@ Module 4 terrain generator will drop straight in.
 Tests cover negative-coordinate math, chunk get/set bounds, cross-chunk and
 negative world access, generator-fills-new-chunks, and streaming load/unload
 counts while moving. All green.
+
+## Module 4 — Terrain generation (done)
+
+**`vg::world::TerrainGenerator`** — an `IChunkGenerator` that produces the world
+deterministically from a seed and *independently per chunk* (a chunk depends
+only on its coordinates + seed, so generation order never matters). Built on
+the Module 1 noise behind the `INoise` interface (DIP):
+
+- **Biomes** (`vg::world::Biome`) from temperature + humidity + elevation:
+  ocean, plains, forest, desert, mountains, snowy — each with its own surface
+  blocks and tree density.
+- **Height & mountains** from fBm elevation with a separate peak field.
+- **Oceans, lakes & rivers** — water fills up to sea level; a river noise cuts
+  channels that flood.
+- **Caves** carved by a 3D noise field crossing zero (winding tunnels).
+- **Ores** placed in stone by depth bands + per-voxel hash (coal→iron→gold→
+  diamond, diamonds only deep).
+- **Trees** per biome (dense forest, sparse plains, none in desert/ocean),
+  kept in the chunk interior so canopies never cross a border.
+- **Structures** — a rare underground room as a worked example; elaborate
+  multi-chunk structures (villages) are a future feature on the same hook.
+
+Tests: determinism, ground+sky, biome variety + land/water, caves exist, ores
+appear only where they should (diamonds only below y=14), and trees appear in
+forests but never on desert sand. `tools/visualize.cpp` renders a top-down
+biome map and a vertical cross-section (caves/ores/water) to PNG.
