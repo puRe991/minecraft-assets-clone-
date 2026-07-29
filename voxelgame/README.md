@@ -59,8 +59,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ✅ done, tested |
 | 6 | Rendering foundation: lighting (sky/block flood-fill) + greedy meshing | ✅ done, tested |
 | 7 | Items, inventory, crafting & smelting (stacks, durability, recipes, furnace) | ✅ done, tested |
-| 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ next |
-| 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ |
+| 8 | Creatures: entities, AI states, A* pathfinding, spawning rules | ✅ done, tested |
+| 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ next |
 | 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ |
 
 Each row is delivered only after its unit tests pass.
@@ -206,3 +206,23 @@ win32/win64.
 Tests: registry/durability, inventory merge/overflow/remove/move, shaped +
 shapeless matching (incl. negative cases), and furnace smelting/fuel logic.
 All green; cross-compiles win32/win64.
+
+## Module 8 — Creatures: entities, AI, pathfinding, spawning (done)
+
+**`vg::entity`** — the creature layer, all headless-testable:
+- **Entities** (`EntityType`/`Entity`/`EntityRegistry`): category
+  (passive/neutral/hostile), health, move speed, sight range. Defaults: pig,
+  cow (passive), wolf (neutral), zombie, skeleton (hostile).
+- **`Pathfinder`** — A* on the voxel grid for a walking creature: a cell is
+  "standable" when feet/head are clear and there's solid ground below;
+  neighbours are level walks, one-block step-ups (with headroom) and drops.
+  Returns a contiguous path or empty when unreachable.
+- **AI** (`decideState` + `steerToward`/`steerAway`): passives flee, hostiles
+  chase within sight, neutrals fight only once provoked.
+- **`Spawner`** — spawn rules: physical room (feet/head clear, ground below)
+  plus light (monsters in the dark ≤7, animals in light ≥9); scans a region
+  for valid spots.
+
+Tests: A* straight line, detour around a wall, step-up, no-path-when-enclosed,
+headroom required; entity registry, AI decisions, steering, and spawn light/
+room rules. All green; cross-compiles win32/win64.
