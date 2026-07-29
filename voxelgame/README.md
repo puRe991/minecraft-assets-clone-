@@ -54,8 +54,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 |---|--------|--------|
 | 1 | Foundation: math (`Vec3`) + noise (`Perlin`, `fBm`) | ✅ done, tested |
 | 2 | Block registry (hardness, tool tier, transparency, light, fluid, gravity) | ✅ done, tested |
-| 3 | Chunk & world storage (infinite streaming) | ⏳ next |
-| 4 | Terrain: biomes, caves & ravines, rivers/oceans, ores, vegetation, structures | ⏳ |
+| 3 | Chunk & world storage (infinite streaming) | ✅ done, tested |
+| 4 | Terrain: biomes, caves & ravines, rivers/oceans, ores, vegetation, structures | ⏳ next |
 | 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ⏳ |
 | 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ |
 | 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ |
@@ -101,3 +101,21 @@ never touches existing code (Open/Closed).
 Tests cover registration/density, air fallback, physics/light/render flags,
 and the full mining matrix (unbreakable, tool speed-up, tier gating, hand
 drops). All green.
+
+## Module 3 — Chunk & world storage (done)
+
+**`vg::world::Chunk`** — pure storage for a `16×16×128` column of blocks, with
+bounds-checked local get/set, a dirty flag (player edits) and a generated
+flag. Nothing about generation or rendering lives here (SRP).
+
+**`vg::world::World`** — owns loaded chunks in a hash map keyed by `ChunkCoord`
+and exposes a flat world-space block API. `floorDiv`/`floorMod`/`worldToChunk`
+handle negative coordinates correctly. `updateStreaming(cx, cz, radius)` loads
+the square region around a centre and unloads everything outside it, so the
+world is effectively infinite in X/Z. Terrain content comes from an injected
+`IChunkGenerator` (DIP) — `FlatChunkGenerator` is the built-in/test one; the
+Module 4 terrain generator will drop straight in.
+
+Tests cover negative-coordinate math, chunk get/set bounds, cross-chunk and
+negative world access, generator-fills-new-chunks, and streaming load/unload
+counts while moving. All green.

@@ -13,18 +13,6 @@
 
 namespace vg::world {
 
-// Well-known ids for the built-in blocks (see registerDefaultBlocks).
-namespace blocks {
-enum : BlockId {
-    Air = 0, Stone, Dirt, Grass, Sand, Gravel, Bedrock,
-    OakLog, OakPlanks, OakLeaves, Glass,
-    Water, Lava,
-    CoalOre, IronOre, GoldOre, DiamondOre,
-    Torch,
-    Count
-};
-}  // namespace blocks
-
 class BlockRegistry {
 public:
     // Register a block type. Its id must equal the next free slot (ids are

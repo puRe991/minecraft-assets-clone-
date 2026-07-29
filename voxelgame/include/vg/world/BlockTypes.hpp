@@ -15,6 +15,20 @@ namespace vg::world {
 
 using BlockId = uint16_t;
 
+// Well-known ids for the built-in blocks. Kept with the data model so any
+// module that includes BlockTypes.hpp (Chunk, generators) can reference them.
+// registerDefaultBlocks() registers types in exactly this order.
+namespace blocks {
+enum : BlockId {
+    Air = 0, Stone, Dirt, Grass, Sand, Gravel, Bedrock,
+    OakLog, OakPlanks, OakLeaves, Glass,
+    Water, Lava,
+    CoalOre, IronOre, GoldOre, DiamondOre,
+    Torch,
+    Count
+};
+}  // namespace blocks
+
 // Which tool class mines a block fastest / is required to harvest its drops.
 enum class ToolType : uint8_t { None, Pickaxe, Axe, Shovel };
 
