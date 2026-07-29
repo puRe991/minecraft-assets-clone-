@@ -104,12 +104,51 @@ tex_done:
     printf("physics (600 steps): %s  (final pos %.1f,%.1f,%.1f)\n",
            fails ? "BAD" : "ok", g_px, g_py, g_pz);
 
-    /* --- break & place --- */
-    g_yaw = 0; g_pitch = -1.4f;   /* look down */
+    /* --- inventory helpers --- */
+    set_gamemode(0);                       /* survival: empty inventory */
+    inv_give(B_STONE, 5);
+    inv_give(B_STONE, 3);                  /* should merge into one stack */
+    if (g_inv[0].block != B_STONE || g_inv[0].count != 8) { printf("FAIL: inv_give merge\n"); fails++; }
+    g_hotbar_sel = 0;
+    for (int i = 0; i < 8; i++) consume_selected();
+    if (g_inv[0].count != 0 || g_inv[0].block != 0) { printf("FAIL: consume_selected\n"); fails++; }
+    /* inv_click: pick up and move a stack */
+    inv_give(B_DIRT, 10);
+    inv_click(0, 0);                       /* pick up from slot 0 */
+    if (g_hand.count != 10 || g_inv[0].count != 0) { printf("FAIL: inv_click pickup\n"); fails++; }
+    inv_click(5, 0);                       /* drop into slot 5 */
+    if (g_inv[5].count != 10 || g_hand.count != 0) { printf("FAIL: inv_click drop\n"); fails++; }
+    printf("inventory: %s\n", fails ? "BAD" : "ok");
+
+    /* --- survival break collects, place consumes --- */
+    gen_world(55); set_gamemode(0);
+    g_yaw = 0; g_pitch = -1.5f;            /* look straight down at the ground */
     do_break();
-    g_selected = B_PLANKS;
-    do_place();
-    printf("break/place: ok (no crash)\n");
+    int got = 0; for (int i = 0; i < INV_SLOTS; i++) got += (g_inv[i].count > 0 ? g_inv[i].count : 0);
+    if (got < 1) { printf("FAIL: survival break gave no item\n"); fails++; }
+    /* select the collected block and place it back */
+    for (int i = 0; i < INV_COLS; i++) if (g_inv[i].count > 0) { g_hotbar_sel = i; break; }
+    int before = g_inv[g_hotbar_sel].count;
+    g_pitch = -1.5f; do_place();
+    if (g_inv[g_hotbar_sel].count > before) { printf("FAIL: place did not consume\n"); fails++; }
+    printf("survival break/place: %s\n", fails ? "BAD" : "ok");
+
+    /* --- creative infinite blocks are not consumed --- */
+    set_gamemode(1);
+    g_hotbar_sel = 2; int cbefore = g_inv[2].count;   /* -1 (infinite) */
+    g_pitch = -1.5f; do_place();
+    if (g_inv[2].count != cbefore) { printf("FAIL: creative consumed a block\n"); fails++; }
+    printf("creative infinite: %s\n", fails ? "BAD" : "ok");
+
+    /* --- fall damage (survival) --- */
+    gen_world(77); set_gamemode(0);
+    int gy = WORLD_Y - 1; while (gy > 0 && get_block(8, gy, 8) == B_AIR) gy--;
+    g_px = 8.5f; g_pz = 8.5f; g_py = gy + 10.0f;    /* ~7-block fall: hurts, not lethal */
+    g_vy = 0; g_air_max_y = g_py; g_was_ground = 0; g_health = 20;
+    for (int s = 0; s < 400; s++) { update_player(1.0f / 60.0f); if (g_was_ground && g_onground) break; }
+    if (g_health >= 20) { printf("FAIL: no fall damage after a drop\n"); fails++; }
+    if (g_health <= 0)  { printf("FAIL: non-lethal drop killed the player\n"); fails++; }
+    printf("fall damage (hp=%d after ~7-block drop): %s\n", g_health, fails ? "BAD" : "ok");
 
     /* --- world save/load round-trip --- */
     gen_world(123);

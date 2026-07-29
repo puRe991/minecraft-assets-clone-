@@ -82,7 +82,29 @@ static float g_vx = 0, g_vy = 0, g_vz = 0;
 static float g_yaw = 0.0f, g_pitch = 0.0f;
 static int   g_onground = 0;
 static int   g_fly = 0;
-static int   g_selected = B_STONE;
+
+/* ---- inventory / game mode ---- */
+typedef struct { uint8_t block; int count; } Slot;   /* count<0 => infinite (creative) */
+#define INV_COLS 9
+#define INV_ROWS 4                       /* 1 hotbar row + 3 storage rows      */
+#define INV_SLOTS (INV_COLS * INV_ROWS)  /* 36, like Minecraft                 */
+#define STACK_MAX 99
+static Slot g_inv[INV_SLOTS];            /* slots 0..8 = hotbar               */
+static int  g_hotbar_sel = 0;            /* selected hotbar slot 0..8         */
+static Slot g_hand = {0, 0};             /* stack held by the cursor in the UI */
+static int  g_gamemode = 0;              /* 0 = survival, 1 = creative         */
+static int  g_inv_open = 0;
+static int  g_health = 20;               /* survival health, 20 = 10 hearts    */
+static float g_air_max_y = 0;            /* highest y while airborne (falls)   */
+static int  g_was_ground = 1;
+static int  g_mouse_ix = RENDER_W / 2, g_mouse_iy = RENDER_H / 2;
+
+static inline int selected_block(void) { return g_inv[g_hotbar_sel].block; }
+
+/* forward decls (definitions live in the gameplay section) */
+static void inv_give(int block, int n);
+static void set_gamemode(int m);
+static void init_inventory(int mode);
 
 static int   g_keys[256];
 static int   g_running = 1;
@@ -653,33 +675,11 @@ static void render_frame(void) {
 
     if (!g_draw_hud) return;
 
-    /* crosshair */
+    /* crosshair (HUD hotbar/hearts are drawn separately in draw_hud) */
     int cxp = RENDER_W / 2, cyp = RENDER_H / 2;
     for (int i = -5; i <= 5; i++) {
         g_framebuf[cyp * RENDER_W + (cxp + i)] ^= 0x00ffffff;
         g_framebuf[(cyp + i) * RENDER_W + cxp] ^= 0x00ffffff;
-    }
-
-    /* hotbar: block ids 1..10 (GLASS = 10), selected slot highlighted */
-    {
-        const int slots = 10, sw = 22, gap = 2;
-        int tot = slots * (sw + gap) - gap;
-        int x0 = (RENDER_W - tot) / 2, y0 = RENDER_H - sw - 6;
-        for (int k = 0; k < slots; k++) {
-            int blk = k + 1;
-            int sxp = x0 + k * (sw + gap);
-            int sel = (blk == g_selected);
-            for (int yy = -2; yy < sw + 2; yy++)
-                for (int xx = -2; xx < sw + 2; xx++) {
-                    int px = sxp + xx, py = y0 + yy;
-                    if (px < 0 || px >= RENDER_W || py < 0 || py >= RENDER_H) continue;
-                    if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
-                        g_framebuf[py * RENDER_W + px] = sel ? 0xffffffffu : 0xff202020u;
-                    else
-                        g_framebuf[py * RENDER_W + px] =
-                            g_tex[blk][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)];
-                }
-        }
     }
 }
 
@@ -760,6 +760,57 @@ static void fb_text_center(int cx, int y, const char *s, uint32_t col, int scale
     fb_text(cx - fb_text_w(s, scale) / 2, y, s, col, scale);
 }
 
+/* draw a block's icon (side texture) scaled into an sw x sw box at (x,y) */
+static void fb_block_icon(int x, int y, int block, int sw) {
+    for (int yy = 0; yy < sw; yy++)
+        for (int xx = 0; xx < sw; xx++)
+            fb_px(x + xx, y + yy, g_tex[block][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)]);
+}
+
+/* a small 7x7 heart */
+static void fb_heart(int x, int y, uint32_t col) {
+    static const unsigned char H[7] = {0x36, 0x7F, 0x7F, 0x7F, 0x3E, 0x1C, 0x08};
+    for (int row = 0; row < 7; row++)
+        for (int c = 0; c < 7; c++)
+            if (H[row] & (1 << (6 - c))) fb_px(x + c, y + row, col);
+}
+
+/* the in-game HUD: hotbar (inventory slots 0..8) + survival hearts */
+static void draw_hud(void) {
+    const int slots = INV_COLS, sw = 22, gap = 2;
+    int tot = slots * (sw + gap) - gap;
+    int x0 = (RENDER_W - tot) / 2, y0 = RENDER_H - sw - 6;
+
+    if (g_gamemode == 0) {               /* survival: 10 hearts above the hotbar */
+        for (int i = 0; i < 10; i++) {
+            int hx = x0 + i * 9, hy = y0 - 12;
+            int hp = g_health - i * 2;
+            fb_heart(hx, hy, 0xff400000u);                 /* empty background */
+            if (hp >= 2) fb_heart(hx, hy, 0xffff3020u);    /* full  */
+            else if (hp == 1) fb_heart(hx, hy, 0xffff8060u);/* half  */
+        }
+    }
+
+    for (int k = 0; k < slots; k++) {
+        int sxp = x0 + k * (sw + gap);
+        int sel = (k == g_hotbar_sel);
+        for (int yy = -2; yy < sw + 2; yy++)
+            for (int xx = -2; xx < sw + 2; xx++) {
+                int px = sxp + xx, py = y0 + yy;
+                if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
+                    fb_px(px, py, sel ? 0xffffffffu : 0xff2a2a2au);
+            }
+        Slot *s = &g_inv[k];
+        if (s->count != 0 && s->block) {
+            fb_block_icon(sxp, y0, s->block, sw);
+            if (s->count > 0) {
+                char n[8]; snprintf(n, sizeof n, "%d", s->count);
+                fb_text(sxp + sw - fb_text_w(n, 1) - 1, y0 + sw - 8, n, 0xffffffffu, 1);
+            }
+        }
+    }
+}
+
 /* ----------------------------------------------------------------------- */
 /* Console output + commands                                                */
 /* ----------------------------------------------------------------------- */
@@ -814,9 +865,10 @@ static void exec_command(const char *line) {
             g_vx = g_vy = g_vz = 0; con_log("teleported"); }
         else con_log("usage: tp x y z");
     } else if (!strcmp(cmd, "give")) {
-        char *a = strtok(NULL, " ");
+        char *a = strtok(NULL, " "), *cnt = strtok(NULL, " ");
         int b = a ? block_from_name(a) : -1;
-        if (b > 0) { g_selected = b; con_log("selected block %d", b); }
+        int n = cnt ? atoi(cnt) : 1; if (n < 1) n = 1;
+        if (b > 0) { inv_give(b, n); con_log("gave %d x block %d", n, b); }
         else con_log("unknown block");
     } else if (!strcmp(cmd, "setblock")) {
         char *ax = strtok(NULL, " "), *ay = strtok(NULL, " "), *az = strtok(NULL, " "), *ab = strtok(NULL, " ");
@@ -840,11 +892,14 @@ static void exec_command(const char *line) {
         } else con_log("usage: fill x1 y1 z1 x2 y2 z2 block");
     } else if (!strcmp(cmd, "gamemode")) {
         char *a = strtok(NULL, " ");
-        if (a && !strcmp(a, "creative")) { g_fly = 1; con_log("creative"); }
-        else if (a && !strcmp(a, "survival")) { g_fly = 0; con_log("survival"); }
+        if (a && (!strcmp(a, "creative") || !strcmp(a, "1"))) { set_gamemode(1); con_log("creative"); }
+        else if (a && (!strcmp(a, "survival") || !strcmp(a, "0"))) { set_gamemode(0); con_log("survival"); }
         else con_log("usage: gamemode creative|survival");
     } else if (!strcmp(cmd, "fly")) {
-        g_fly = !g_fly; con_log("fly %s", g_fly ? "on" : "off");
+        if (g_gamemode == 1) { g_fly = !g_fly; con_log("fly %s", g_fly ? "on" : "off"); }
+        else con_log("fly is creative-only");
+    } else if (!strcmp(cmd, "heal")) {
+        g_health = 20; con_log("healed");
     } else if (!strcmp(cmd, "speed")) {
         char *a = strtok(NULL, " ");
         if (a) { g_movespeed = (float)atof(a); con_log("speed %.2f", g_movespeed); }
@@ -930,17 +985,20 @@ static void render_frame_menu_bg(void) {
 
 static void render_create(void) {
     fb_dim(0, 0, RENDER_W, RENDER_H, 110);
-    fb_text_center(RENDER_W / 2, 50, "CREATE NEW WORLD", 0xffffffffu, 2);
-    fb_text_center(RENDER_W / 2, 100, "SEED (BLANK = RANDOM):", 0xffb0b0b0u, 1);
-    int fx = (RENDER_W - 220) / 2, fy = 118;
+    fb_text_center(RENDER_W / 2, 46, "CREATE NEW WORLD", 0xffffffffu, 2);
+    fb_text_center(RENDER_W / 2, 84, "SEED (BLANK = RANDOM):", 0xffb0b0b0u, 1);
+    int fx = (RENDER_W - 220) / 2, fy = 100;
     fb_fill(fx, fy, 220, 20, 0xff202020u);
     fb_fill(fx, fy, 220, 1, 0xff808080u);
     char shown[130];
     snprintf(shown, sizeof shown, "%s_", g_input);
     fb_text(fx + 6, fy + 6, shown, 0xffffffffu, 1);
+    char mode[48];
+    snprintf(mode, sizeof mode, "< MODE: %s >", g_gamemode ? "CREATIVE" : "SURVIVAL");
+    fb_text_center(RENDER_W / 2, 130, mode, 0xffffd040u, 1);
     draw_button(0, "CREATE WORLD");
     draw_button(1, "BACK");
-    fb_text_center(RENDER_W / 2, RENDER_H - 12, "TYPE A SEED, ENTER TO CREATE", 0xff909090u, 1);
+    fb_text_center(RENDER_W / 2, RENDER_H - 12, "SEED + ENTER   -   LEFT/RIGHT: MODE", 0xff909090u, 1);
 }
 
 static const char *g_settings_names[] = {"FOV", "RENDER DISTANCE", "MOUSE SENSITIVITY", "MOVE SPEED", "DAYLIGHT"};
@@ -998,6 +1056,89 @@ static void render_console_overlay(void) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* Inventory screen (Minecraft-style slot grid, click to move stacks)       */
+/* ----------------------------------------------------------------------- */
+
+#define SS 20                            /* inventory slot size */
+static int inv_slot_x(int col) {
+    int gw = INV_COLS * (SS + 2) - 2, gx = (RENDER_W - gw) / 2;
+    return gx + col * (SS + 2);
+}
+static int inv_slot_y(int row) {         /* rows 0..2 = storage, row 3 = hotbar */
+    int top = 78;
+    return (row < 3) ? top + row * (SS + 2) : top + 3 * (SS + 2) + 8;
+}
+static int slot_index(int row, int col) { return (row < 3) ? 9 + row * INV_COLS + col : col; }
+
+static int inv_slot_at(int ix, int iy) {
+    for (int row = 0; row < 4; row++)
+        for (int col = 0; col < INV_COLS; col++) {
+            int x = inv_slot_x(col), y = inv_slot_y(row);
+            if (ix >= x && ix < x + SS && iy >= y && iy < y + SS) return slot_index(row, col);
+        }
+    return -1;
+}
+
+/* pick up / place / swap / split a stack, Minecraft-style */
+static void inv_click(int idx, int right) {
+    if (idx < 0) return;
+    Slot *s = &g_inv[idx];
+    if (!right) {
+        if (g_hand.count == 0) {
+            if (s->count < 0) { g_hand.block = s->block; g_hand.count = STACK_MAX; }   /* grab from infinite */
+            else if (s->count > 0) { g_hand = *s; s->block = 0; s->count = 0; }
+        } else {
+            if (s->count == 0) { *s = g_hand; g_hand.block = 0; g_hand.count = 0; }
+            else if (s->count < 0) { g_hand.block = 0; g_hand.count = 0; }              /* drop into infinite */
+            else if (s->block == g_hand.block) {
+                int space = STACK_MAX - s->count, mv = g_hand.count < space ? g_hand.count : space;
+                s->count += mv; g_hand.count -= mv; if (g_hand.count == 0) g_hand.block = 0;
+            } else { Slot t = *s; *s = g_hand; g_hand = t; }
+        }
+    } else {
+        if (g_hand.count == 0) {
+            if (s->count > 0) { int half = (s->count + 1) / 2; g_hand.block = s->block; g_hand.count = half;
+                s->count -= half; if (s->count == 0) s->block = 0; }
+            else if (s->count < 0) { g_hand.block = s->block; g_hand.count = 1; }
+        } else {
+            if (s->count == 0) { s->block = g_hand.block; s->count = 1; if (--g_hand.count == 0) g_hand.block = 0; }
+            else if (s->count > 0 && s->block == g_hand.block && s->count < STACK_MAX) {
+                s->count++; if (--g_hand.count == 0) g_hand.block = 0; }
+        }
+    }
+}
+
+static void render_inventory(void) {
+    fb_dim(0, 0, RENDER_W, RENDER_H, 150);
+    int gw = INV_COLS * (SS + 2) - 2, gx = (RENDER_W - gw) / 2;
+    fb_fill(gx - 8, 62, gw + 16, inv_slot_y(3) + SS - 62 + 8, 0xff303030u);
+    fb_text_center(RENDER_W / 2, 66, g_gamemode ? "CREATIVE INVENTORY" : "INVENTORY", 0xffffffffu, 2);
+    for (int row = 0; row < 4; row++)
+        for (int col = 0; col < INV_COLS; col++) {
+            int idx = slot_index(row, col), x = inv_slot_x(col), y = inv_slot_y(row);
+            int hot = (row == 3 && col == g_hotbar_sel);
+            fb_fill(x - 1, y - 1, SS + 2, SS + 2, hot ? 0xffffffffu : 0xff181818u);
+            fb_fill(x, y, SS, SS, 0xff585858u);
+            Slot *s = &g_inv[idx];
+            if (s->count != 0 && s->block) {
+                fb_block_icon(x, y, s->block, SS);
+                if (s->count > 0) {
+                    char n[8]; snprintf(n, sizeof n, "%d", s->count);
+                    fb_text(x + SS - fb_text_w(n, 1) - 1, y + SS - 8, n, 0xffffffffu, 1);
+                }
+            }
+        }
+    if (g_hand.count != 0 && g_hand.block) {
+        fb_block_icon(g_mouse_ix - SS / 2, g_mouse_iy - SS / 2, g_hand.block, SS);
+        if (g_hand.count > 0) {
+            char n[8]; snprintf(n, sizeof n, "%d", g_hand.count);
+            fb_text(g_mouse_ix + 2, g_mouse_iy + 2, n, 0xffffffffu, 1);
+        }
+    }
+    fb_text_center(RENDER_W / 2, RENDER_H - 12, "E TO CLOSE   -   CLICK TO MOVE STACKS", 0xff909090u, 1);
+}
+
+/* ----------------------------------------------------------------------- */
 /* Player physics & interaction                                             */
 /* ----------------------------------------------------------------------- */
 
@@ -1016,6 +1157,54 @@ static int collide(float ex, float ey, float ez) {
     return 0;
 }
 
+/* add n of a block into the inventory (merge stacks, then fill empty slots) */
+static void inv_give(int block, int n) {
+    if (block <= 0 || n <= 0) return;
+    for (int i = 0; i < INV_SLOTS && n > 0; i++)
+        if (g_inv[i].block == block && g_inv[i].count >= 0 && g_inv[i].count < STACK_MAX) {
+            int add = STACK_MAX - g_inv[i].count; if (add > n) add = n;
+            g_inv[i].count += add; n -= add;
+        }
+    for (int i = 0; i < INV_SLOTS && n > 0; i++)
+        if (g_inv[i].count == 0) {
+            g_inv[i].block = (uint8_t)block;
+            int add = n > STACK_MAX ? STACK_MAX : n;
+            g_inv[i].count = add; n -= add;
+        }
+}
+
+/* consume one of the selected hotbar block (no-op in creative) */
+static void consume_selected(void) {
+    if (g_gamemode == 1) return;
+    Slot *s = &g_inv[g_hotbar_sel];
+    if (s->count > 0 && --s->count == 0) s->block = 0;
+}
+
+static void init_inventory(int mode) {
+    for (int i = 0; i < INV_SLOTS; i++) { g_inv[i].block = 0; g_inv[i].count = 0; }
+    g_hand.block = 0; g_hand.count = 0;
+    g_health = 20;
+    if (mode == 1) {                         /* creative: infinite blocks */
+        int blk[] = {B_GRASS, B_DIRT, B_STONE, B_COBBLE, B_LOG,
+                     B_LEAVES, B_SAND, B_PLANKS, B_GLASS, B_WATER};
+        for (int i = 0; i < 10; i++) { g_inv[i].block = (uint8_t)blk[i]; g_inv[i].count = -1; }
+    }
+}
+
+static void set_gamemode(int m) {
+    g_gamemode = m;
+    if (m == 0) g_fly = 0;
+    init_inventory(m);
+}
+
+static void respawn(void) {
+    g_px = 8.5f; g_pz = 8.5f; stream_chunks();
+    int cy = WORLD_Y - 1;
+    while (cy > 0 && get_block(8, cy, 8) == B_AIR) cy--;
+    g_py = cy + 2.6f;
+    g_vx = g_vy = g_vz = 0; g_health = 20; g_air_max_y = g_py; g_was_ground = 1;
+}
+
 static void update_player(float dt) {
     stream_chunks();                 /* keep terrain loaded around the player */
     float cy = cosf(g_yaw), sy = sinf(g_yaw);
@@ -1031,9 +1220,10 @@ static void update_player(float dt) {
     float wl = sqrtf(wish_x * wish_x + wish_z * wish_z);
     if (wl > 0) { wish_x /= wl; wish_z /= wl; }
 
-    float speed = (g_fly ? 9.0f : 4.5f) * g_movespeed;
+    int flying = g_fly && g_gamemode == 1;   /* fly is a creative-only ability */
+    float speed = (flying ? 9.0f : 4.5f) * g_movespeed;
 
-    if (g_fly) {
+    if (flying) {
         g_vx = wish_x * speed; g_vz = wish_z * speed;
         g_vy = 0;
         if (g_keys[0x20])   g_vy = speed;   /* 0x20 = VK_SPACE / ' ' */
@@ -1053,32 +1243,54 @@ static void update_player(float dt) {
     if (!collide(g_px, ny, g_pz)) { g_py = ny; g_onground = 0; }
     else { if (g_vy < 0) g_onground = 1; g_vy = 0; }
 
-    if (g_py < -40) { g_py = 60; g_vy = 0; }  /* fell out: reset height */
+    /* fall damage (survival only) */
+    if (!g_onground) {
+        if (g_py > g_air_max_y) g_air_max_y = g_py;
+    } else {
+        if (!g_was_ground && g_gamemode == 0 && !flying) {
+            float fall = g_air_max_y - g_py;
+            if (fall > 3.0f) {
+                g_health -= (int)(fall - 3.0f);
+                if (g_health <= 0) { respawn(); }
+            }
+        }
+        g_air_max_y = g_py;
+    }
+    g_was_ground = g_onground;
+
+    if (g_py < -40) { respawn(); }  /* fell out of the world */
 }
 
 static void do_break(void) {
     V3 f, r, u; camera_basis(&f, &r, &u);
     int hx, hy, hz, nx, ny, nz, blk; float d;
     if (raycast(g_px, g_py, g_pz, f.x, f.y, f.z, REACH,
-                &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk))
+                &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk)) {
+        int broken = get_block(hx, hy, hz);
         set_block(hx, hy, hz, B_AIR);
+        if (g_gamemode == 0 && broken != B_AIR && broken != B_WATER)
+            inv_give(broken, 1);          /* survival: collect the block */
+    }
 }
 
 static void do_place(void) {
+    int blk_sel = selected_block();
+    if (blk_sel <= 0) return;                     /* nothing selected/available */
+    if (g_gamemode == 0 && g_inv[g_hotbar_sel].count <= 0) return;
     V3 f, r, u; camera_basis(&f, &r, &u);
     int hx, hy, hz, nx, ny, nz, blk; float d;
     if (raycast(g_px, g_py, g_pz, f.x, f.y, f.z, REACH,
                 &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk)) {
         int bx = hx + nx, by = hy + ny, bz = hz + nz;
         /* don't place inside the player */
-        float ex = bx + 0.5f, ey = by + 0.5f, ez = bz + 0.5f;
         int px0 = (int)floorf(g_px - PLR_RAD), px1 = (int)floorf(g_px + PLR_RAD);
         int py0 = (int)floorf(g_py - PLR_FEET), py1 = (int)floorf(g_py + PLR_HEAD);
         int pz0 = (int)floorf(g_pz - PLR_RAD), pz1 = (int)floorf(g_pz + PLR_RAD);
-        (void)ex; (void)ey; (void)ez;
         int inside = (bx >= px0 && bx <= px1 && by >= py0 && by <= py1 && bz >= pz0 && bz <= pz1);
-        if (!inside && get_block(bx, by, bz) == B_AIR)
-            set_block(bx, by, bz, (uint8_t)g_selected);
+        if (!inside && get_block(bx, by, bz) == B_AIR) {
+            set_block(bx, by, bz, (uint8_t)blk_sel);
+            consume_selected();
+        }
     }
 }
 
@@ -1094,12 +1306,17 @@ static volatile int g_enter = 0;
 static volatile int g_esc = 0;
 static volatile int g_click_x = -1, g_click_y = -1;
 
+static volatile int g_lclick = 0, g_rclick = 0;   /* UI clicks (edge)          */
+static volatile int g_toggle_inv = 0;             /* E pressed                 */
+
 static void start_world(unsigned seed) {
     g_seed = seed;
     gen_world(seed);
+    init_inventory(g_gamemode);
     g_state = ST_PLAY;
     g_paused = 0;
     g_console_open = 0;
+    g_inv_open = 0;
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1128,17 +1345,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == VK_RETURN) g_enter = 1;
         if (w == VK_ESCAPE) g_esc = 1;
 
-        /* gameplay hotkeys only while actively playing */
-        if (g_state == ST_PLAY && !g_paused && !g_console_open) {
+        if (w == 'E' && g_state == ST_PLAY && !g_paused && !g_console_open) g_toggle_inv = 1;
+
+        /* gameplay hotkeys only while actively playing (not in a UI overlay) */
+        if (g_state == ST_PLAY && !g_paused && !g_console_open && !g_inv_open) {
             if (w == 'F') g_fly = !g_fly;
-            if (w == 'R') { g_seed = (unsigned)GetTickCount(); gen_world(g_seed); }
+            if (w == 'G') set_gamemode(g_gamemode ^ 1);
+            if (w == 'R') { g_seed = (unsigned)GetTickCount(); gen_world(g_seed); init_inventory(g_gamemode); }
             if (w == 'K') save_world("world.sav");
             if (w == 'L') load_world("world.sav");
-            if (w >= '1' && w <= '9') { int i = (int)w - '0'; if (i < B_COUNT) g_selected = i; }
-            if (w == '0') g_selected = B_GLASS;
+            if (w >= '1' && w <= '9') g_hotbar_sel = (int)w - '1';   /* select hotbar slot */
             if (w == 'T' || w == VK_OEM_2) {   /* T or '/' opens console */
                 g_console_open = 1; g_input_len = 0; g_input[0] = 0;
-                if (w == VK_OEM_2) { /* prefix nothing; user types command */ }
             }
         }
         return 0;
@@ -1147,12 +1365,29 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w < 256) g_keys[w] = 0;
         return 0;
 
+    case WM_MOUSEMOVE:
+        if (g_inv_open) {
+            g_mouse_ix = g_client_w ? (short)LOWORD(l) * RENDER_W / g_client_w : 0;
+            g_mouse_iy = g_client_h ? (short)HIWORD(l) * RENDER_H / g_client_h : 0;
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL: {                    /* scroll changes hotbar slot */
+        if (g_state == ST_PLAY && !g_paused && !g_console_open && !g_inv_open) {
+            int d = GET_WHEEL_DELTA_WPARAM(w) > 0 ? -1 : 1;
+            g_hotbar_sel = (g_hotbar_sel + d + INV_COLS) % INV_COLS;
+        }
+        return 0;
+    }
+
     case WM_LBUTTONDOWN:
-        if (g_state == ST_PLAY && !g_paused && !g_console_open) g_break_req = 1;
+        if (g_inv_open) { g_click_x = LOWORD(l); g_click_y = HIWORD(l); g_lclick = 1; }
+        else if (g_state == ST_PLAY && !g_paused && !g_console_open) g_break_req = 1;
         else { g_click_x = LOWORD(l); g_click_y = HIWORD(l); }
         return 0;
     case WM_RBUTTONDOWN:
-        if (g_state == ST_PLAY && !g_paused && !g_console_open) g_place_req = 1;
+        if (g_inv_open) { g_click_x = LOWORD(l); g_click_y = HIWORD(l); g_rclick = 1; }
+        else if (g_state == ST_PLAY && !g_paused && !g_console_open) g_place_req = 1;
         return 0;
     }
     return DefWindowProc(h, m, w, l);
@@ -1224,7 +1459,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
         prev = now;
         if (dt > 0.1f) dt = 0.1f;
 
-        int playing = (g_state == ST_PLAY && !g_paused && !g_console_open);
+        int playing = (g_state == ST_PLAY && !g_paused && !g_console_open && !g_inv_open);
 
         /* ---- mouse look (only while actively playing) ---- */
         if (g_focused && playing) {
@@ -1265,6 +1500,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
         }
         else if (g_state == ST_CREATE) {
             if (g_nav) { g_menu_sel ^= 1; g_nav = 0; }
+            if (g_navlr) { g_gamemode ^= 1; g_navlr = 0; }   /* toggle survival/creative */
             int click = -1;
             if (g_click_x >= 0) { int ix, iy; click_to_internal(&ix, &iy); click = button_at(ix, iy, 2); g_click_x = -1; }
             if (click == 0 || (g_enter)) { g_enter = 0; start_world(seed_from_string(g_input)); }
@@ -1286,7 +1522,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
             render_settings();
         }
         else { /* ST_PLAY */
-            if (g_console_open) {
+            if (g_toggle_inv) { g_toggle_inv = 0; g_inv_open = !g_inv_open; }
+            if (g_inv_open) {
+                if (g_esc) { g_esc = 0; g_inv_open = 0; }
+                if (g_lclick || g_rclick) {
+                    int ix, iy; click_to_internal(&ix, &iy);
+                    int slot = inv_slot_at(ix, iy);
+                    inv_click(slot, g_rclick ? 1 : 0);
+                    g_lclick = g_rclick = 0; g_click_x = -1;
+                }
+            } else if (g_console_open) {
                 if (g_enter) { g_enter = 0; if (g_input_len) exec_command(g_input); g_input_len = 0; g_input[0] = 0; }
                 if (g_esc)   { g_esc = 0; g_console_open = 0; }
             } else if (g_paused) {
@@ -1309,6 +1554,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
             }
 
             render_frame();
+            if (!g_inv_open) draw_hud();
+            if (g_inv_open) render_inventory();
             if (g_console_open) render_console_overlay();
             if (g_paused) {
                 fb_dim(0, 0, RENDER_W, RENDER_H, 120);

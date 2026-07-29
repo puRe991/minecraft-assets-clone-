@@ -20,9 +20,16 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
 
 ## Features
 
+- **Survival & Creative modes** — Survival has health, fall damage, and
+  block gathering (breaking a block drops it into your inventory, placing
+  consumes it); Creative gives flight and unlimited blocks. Pick the mode on
+  the create-world screen, or switch in game with `G` / `/gamemode`.
+- **Minecraft-style inventory** (`E`) — a 9×4 slot grid (hotbar + 3 storage
+  rows); click to pick up / drop / swap stacks, right-click to split, scroll
+  or `1`–`9` to pick the hotbar slot. Survival shows a heart health bar.
 - **Main menu** with a rotating world panorama, keyboard + mouse navigation
 - **Create-world screen with seeds** — type a seed (number or text) like in
-  Minecraft; blank = random
+  Minecraft; blank = random; choose Survival/Creative with Left/Right
 - **In-game console** (`T` or `/`) with commands: `tp`, `give`, `setblock`,
   `fill`, `time`, `gamemode`, `fly`, `speed`, `fov`, `regen`, `seed`, `help`, …
 - **Settings screen** — FOV, render distance, mouse sensitivity, move speed,
@@ -70,16 +77,21 @@ procedurally generated texture for that block, so it always runs.
 | Mouse | Look around |
 | `W` `A` `S` `D` | Move |
 | `Space` | Jump (fly up when flying) |
-| `Left Shift` | Fly down (when flying) |
-| `F` | Toggle fly mode |
-| Left mouse | Break block |
-| Right mouse | Place block |
-| `1`–`9`, `0` | Select block to place (hotbar) |
+| `Left Shift` | Fly down (creative fly) |
+| `E` | Open / close the inventory |
+| `F` | Toggle fly (creative only) |
+| `G` | Toggle survival / creative |
+| Left mouse | Break block (collects it in survival) |
+| Right mouse | Place block (consumes it in survival) |
+| `1`–`9` / scroll | Select hotbar slot |
 | `T` or `/` | Open the console |
 | `K` / `L` | Save / load the world (`world.sav`) |
 | `R` | Regenerate the world |
-| `Esc` | Pause menu (in game) / back (in menus) |
+| `Esc` | Pause menu / close overlay / back |
 | Arrows + `Enter` | Navigate menus (mouse click also works) |
+
+In the inventory: **left-click** picks up / drops / swaps a whole stack,
+**right-click** picks up half or drops one.
 
 A saved world (`world.sav`) is written next to the game and is loaded
 automatically on the next launch.
@@ -93,7 +105,9 @@ help                       list commands
 seed                       show the current world seed
 time day|night|<0..1>      set the time of day
 tp <x> <y> <z>             teleport
-give <block>               select a block (name or id)
+give <block> [n]           add n of a block to the inventory
+gamemode survival|creative switch mode
+heal                       refill health
 setblock <x> <y> <z> <b>   place a block
 fill <x1 y1 z1 x2 y2 z2> <b>  fill a region
 gamemode creative|survival creative = fly

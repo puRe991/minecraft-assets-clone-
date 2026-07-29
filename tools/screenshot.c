@@ -82,17 +82,40 @@ int main(void) {
     save_fb("07_settings", 2);
 
     /* in-game console with command output */
-    g_state = ST_PLAY; g_draw_hud = 1;
+    g_state = ST_PLAY; g_console_open = 0; g_inv_open = 0;
+    g_daylight = 1.0f;
     g_px = sx; g_py = sy; g_pz = sz; g_yaw = 0.7f; g_pitch = -0.15f;
     exec_command("help");
     exec_command("seed");
     exec_command("time night");
-    exec_command("give glass");
+    exec_command("give glass 12");
     g_console_open = 1;
     snprintf(g_input, sizeof g_input, "tp 64 40 64"); g_input_len = 11;
     render_frame();
     render_console_overlay();
     save_fb("08_console", 2);
+
+    /* survival HUD: hearts + hotbar with collected blocks */
+    g_console_open = 0; g_daylight = 1.0f;
+    set_gamemode(0);
+    inv_give(B_GRASS, 34); inv_give(B_DIRT, 12); inv_give(B_STONE, 48);
+    inv_give(B_LOG, 7); inv_give(B_COBBLE, 21); inv_give(B_SAND, 5);
+    g_health = 14; g_hotbar_sel = 2;
+    g_px = sx; g_py = sy; g_pz = sz; g_yaw = 0.7f; g_pitch = -0.12f;
+    render_frame(); draw_hud();
+    save_fb("09_survival_hud", 2);
+
+    /* survival inventory screen */
+    inv_give(B_PLANKS, 30); inv_give(B_LEAVES, 16); inv_give(B_GLASS, 9);
+    g_inv_open = 1; g_mouse_ix = RENDER_W / 2 + 40; g_mouse_iy = 120;
+    g_hand.block = B_STONE; g_hand.count = 12;
+    render_frame(); render_inventory();
+    save_fb("10_inventory", 2);
+
+    /* creative inventory */
+    set_gamemode(1); g_inv_open = 1; g_hand.block = 0; g_hand.count = 0;
+    render_frame(); render_inventory();
+    save_fb("11_creative_inventory", 2);
 
     printf("done.\n");
     return 0;
