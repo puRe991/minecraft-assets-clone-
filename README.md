@@ -34,7 +34,9 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
   `fill`, `time`, `gamemode`, `fly`, `speed`, `fov`, `regen`, `seed`, `help`, …
 - **Settings screen** — FOV, render distance, mouse sensitivity, move speed,
   and daylight, all adjustable live
-- **Day / night** lighting
+- **Day / night cycle** — the sun and moon arc across the sky, the light and
+  sky colour shift through sunrise, noon, sunset and night; cycle length is
+  adjustable in Settings, and `/time day|night|<0..1>` jumps to a time
 - **Chunk-streamed world** — 16×16 chunks generate and unload around the
   player as you walk, so the world extends effectively without limit in X/Z
   (including negative coordinates)

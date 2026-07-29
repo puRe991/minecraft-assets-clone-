@@ -136,8 +136,13 @@ static float g_fov = 70.0f;
 static float g_render_dist = 96.0f;
 static float g_sensitivity = 0.25f;  /* x1000 -> radians per pixel         */
 static float g_movespeed = 1.0f;
-static float g_daylight = 1.0f;      /* 1 = day, 0 = night                 */
+static float g_daylight = 1.0f;      /* 0..1 brightness, derived from g_tod */
+static float g_daylen = 240.0f;      /* seconds per full day/night cycle    */
 static unsigned g_seed = 2024;
+
+/* time of day: 0 = midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset */
+static float g_tod = 0.30f;
+static float daylight_from_tod(float t) { return 0.5f - 0.5f * cosf(2.0f * (float)M_PI * t); }
 
 /* ---- console output ring buffer ---- */
 #define CON_LINES 10
@@ -616,8 +621,23 @@ static void render_frame(void) {
     if (maxray > loaded) maxray = loaded;
     float dl = g_daylight; if (dl < 0.12f) dl = 0.12f;   /* keep a little moonlight */
 
-    const uint32_t sky_top = rgb((int)(120 * dl), (int)(170 * dl), (int)(235 * dl));
-    const uint32_t sky_bot = rgb((int)(200 * dl), (int)(225 * dl), (int)(250 * dl));
+    /* sky colour shifts warm at dawn/dusk */
+    float warm = 0.0f;
+    { float d = g_tod - 0.25f; if (d < -0.5f) d += 1; if (d > 0.5f) d -= 1;  /* dist to sunrise */
+      float d2 = g_tod - 0.75f; if (d2 < -0.5f) d2 += 1; if (d2 > 0.5f) d2 -= 1; /* to sunset */
+      float m = fabsf(d) < fabsf(d2) ? fabsf(d) : fabsf(d2);
+      warm = 1.0f - m / 0.10f; if (warm < 0) warm = 0; }
+    int sr_t = (int)((120 + warm * 90) * dl), sg_t = (int)((170 + warm * 20) * dl), sb_t = (int)((235 - warm * 120) * dl);
+    int sr_b = (int)((200 + warm * 40) * dl), sg_b = (int)((225 - warm * 40) * dl), sb_b = (int)((250 - warm * 120) * dl);
+    const uint32_t sky_top = rgb(sr_t, sg_t, sb_t);
+    const uint32_t sky_bot = rgb(sr_b, sg_b, sb_b);
+
+    /* sun / moon direction (moves through the sky with the time of day) */
+    float phase = (g_tod - 0.25f) * 2.0f * (float)M_PI;
+    float su_x = cosf(phase), su_y = sinf(phase), su_z = 0.35f;
+    float sl = 1.0f / sqrtf(su_x * su_x + su_y * su_y + su_z * su_z);
+    su_x *= sl; su_y *= sl; su_z *= sl;
+    int sun_up = (su_y > -0.05f);       /* sun above horizon => daytime disc */
 
     for (int y = 0; y < RENDER_H; y++) {
         float sv = (1.0f - 2.0f * (y + 0.5f) / RENDER_H) * tanf_;
@@ -668,6 +688,18 @@ static void render_frame(void) {
                 col = rgb((int)(r1 + (r2 - r1) * t),
                           (int)(g1 + (g2 - g1) * t),
                           (int)(b1 + (b2 - b1) * t));
+                /* sun or moon disc + soft halo */
+                float dot = dx * su_x + dy * su_y + dz * su_z;
+                if (sun_up) {
+                    if (dot > 0.9995f)      col = rgb(255, 245, 200);           /* sun */
+                    else if (dot > 0.995f)  col = rgb((int)(255 * 0.6f + ((col >> 16) & 0xff) * 0.4f),
+                                                      (int)(230 * 0.6f + ((col >> 8) & 0xff) * 0.4f),
+                                                      (int)(160 * 0.6f + (col & 0xff) * 0.4f));
+                } else {
+                    float md = -dot;   /* moon is opposite the sun */
+                    if (md > 0.9995f)      col = rgb(230, 230, 245);            /* moon */
+                    else if (md > 0.997f)  col = rgb(180, 180, 200);
+                }
             }
             g_framebuf[y * RENDER_W + x] = col;
         }
@@ -856,9 +888,10 @@ static void exec_command(const char *line) {
     } else if (!strcmp(cmd, "time")) {
         char *a = strtok(NULL, " ");
         if (!a) con_log("usage: time day|night|<0..1>");
-        else if (!strcmp(a, "day")) { g_daylight = 1.0f; con_log("time set day"); }
-        else if (!strcmp(a, "night")) { g_daylight = 0.15f; con_log("time set night"); }
-        else { g_daylight = (float)atof(a); con_log("daylight %.2f", g_daylight); }
+        else if (!strcmp(a, "day"))   { g_tod = 0.5f;  con_log("time set day"); }
+        else if (!strcmp(a, "night")) { g_tod = 0.0f;  con_log("time set night"); }
+        else { g_tod = (float)atof(a); g_tod -= floorf(g_tod); con_log("time %.2f", g_tod); }
+        g_daylight = daylight_from_tod(g_tod);
     } else if (!strcmp(cmd, "tp")) {
         char *ax = strtok(NULL, " "), *ay = strtok(NULL, " "), *az = strtok(NULL, " ");
         if (ax && ay && az) { g_px = (float)atof(ax); g_py = (float)atof(ay); g_pz = (float)atof(az);
@@ -1001,16 +1034,16 @@ static void render_create(void) {
     fb_text_center(RENDER_W / 2, RENDER_H - 12, "SEED + ENTER   -   LEFT/RIGHT: MODE", 0xff909090u, 1);
 }
 
-static const char *g_settings_names[] = {"FOV", "RENDER DISTANCE", "MOUSE SENSITIVITY", "MOVE SPEED", "DAYLIGHT"};
+static const char *g_settings_names[] = {"FOV", "RENDER DISTANCE", "MOUSE SENSITIVITY", "MOVE SPEED", "DAY LENGTH (S)"};
 static float *settings_ptr(int i) {
     switch (i) { case 0: return &g_fov; case 1: return &g_render_dist;
-                 case 2: return &g_sensitivity; case 3: return &g_movespeed; default: return &g_daylight; }
+                 case 2: return &g_sensitivity; case 3: return &g_movespeed; default: return &g_daylen; }
 }
 static void settings_adjust(int i, int dir) {
     float *p = settings_ptr(i);
-    float step[] = {5, 8, 0.05f, 0.1f, 0.1f};
-    float lo[]   = {30, 24, 0.05f, 0.3f, 0.1f};
-    float hi[]   = {110, (LOADR - 1) * CH, 1.0f, 4.0f, 1.0f};
+    float step[] = {5, 8, 0.05f, 0.1f, 30};
+    float lo[]   = {30, 24, 0.05f, 0.3f, 30};
+    float hi[]   = {110, (LOADR - 1) * CH, 1.0f, 4.0f, 1200};
     *p += dir * step[i];
     if (*p < lo[i]) *p = lo[i];
     if (*p > hi[i]) *p = hi[i];
@@ -1025,7 +1058,7 @@ static void render_settings(void) {
         uint32_t col = sel ? 0xffffff40u : 0xffe0e0e0u;
         char val[48];
         float v = *settings_ptr(i);
-        if (i == 0 || i == 1) snprintf(val, sizeof val, "%.0f", v);
+        if (i == 0 || i == 1 || i == 4) snprintf(val, sizeof val, "%.0f", v);
         else snprintf(val, sizeof val, "%.2f", v);
         fb_text(80, y, g_settings_names[i], col, 1);
         char line[64]; snprintf(line, sizeof line, "< %s >", val);
@@ -1551,6 +1584,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
                 if (g_break_req) { do_break(); g_break_req = 0; }
                 if (g_place_req) { do_place(); g_place_req = 0; }
                 update_player(dt);
+                g_tod += dt / g_daylen;             /* advance day/night cycle */
+                if (g_tod >= 1.0f) g_tod -= 1.0f;
+                g_daylight = daylight_from_tod(g_tod);
             }
 
             render_frame();

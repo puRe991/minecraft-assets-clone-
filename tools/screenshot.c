@@ -117,6 +117,23 @@ int main(void) {
     render_frame(); render_inventory();
     save_fb("11_creative_inventory", 2);
 
+    /* day/night cycle: sunrise, noon, sunset, night (sun & moon) */
+    gen_world(2024);
+    sx = g_px; sy = g_py; sz = g_pz;
+    g_inv_open = 0; g_console_open = 0; g_gamemode = 1;
+    struct { const char *name; float tod; float yaw; float pitch; } times[] = {
+        {"12_sunrise", 0.25f, 1.57f, 0.10f},
+        {"13_noon",    0.50f, 0.70f, 0.30f},
+        {"14_sunset",  0.75f, 4.71f, 0.10f},
+        {"15_night",   0.02f, 3.48f, 1.05f},
+    };
+    for (int i = 0; i < 4; i++) {
+        g_tod = times[i].tod; g_daylight = daylight_from_tod(g_tod);
+        g_px = sx; g_py = sy + 4; g_pz = sz; g_yaw = times[i].yaw; g_pitch = times[i].pitch;
+        render_frame(); draw_hud();
+        save_fb(times[i].name, 2);
+    }
+
     printf("done.\n");
     return 0;
 }
