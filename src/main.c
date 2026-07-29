@@ -41,10 +41,11 @@
 /* Configuration                                                            */
 /* ----------------------------------------------------------------------- */
 
-#define WORLD_X 128
-#define WORLD_Y 64
-#define WORLD_Z 128
+#define WORLD_Y 64            /* fixed world height                         */
 #define WATER_LEVEL 22
+#define CH 16                 /* chunk size in X and Z                      */
+#define LOADR 8               /* chunk load radius around the player        */
+#define GS (2 * LOADR + 1)    /* loaded-chunk grid side (toroidal)          */
 
 #define RENDER_W 480          /* internal render resolution (upscaled)      */
 #define RENDER_H 270
@@ -68,11 +69,15 @@ enum {
 /* Globals                                                                  */
 /* ----------------------------------------------------------------------- */
 
-static uint8_t  g_world[WORLD_X * WORLD_Y * WORLD_Z];
+/* A chunk is CH x CH x WORLD_Y blocks. Loaded chunks live in a toroidal
+   grid that follows the player, so the world streams "infinitely" in X/Z. */
+typedef struct { int cx, cz, valid; uint8_t b[CH * CH * WORLD_Y]; } Chunk;
+static Chunk g_chunks[GS * GS];
+
 static uint32_t g_framebuf[RENDER_W * RENDER_H];
 static uint32_t g_tex[B_COUNT][3][TEX * TEX];   /* [block][face 0=top,1=side,2=bottom] */
 
-static float g_px = WORLD_X * 0.5f, g_py = 40.0f, g_pz = WORLD_Z * 0.5f;
+static float g_px = 8.5f, g_py = 40.0f, g_pz = 8.5f;
 static float g_vx = 0, g_vy = 0, g_vz = 0;
 static float g_yaw = 0.0f, g_pitch = 0.0f;
 static int   g_onground = 0;
@@ -121,15 +126,32 @@ static int  g_console_n = 0;
 /* World access                                                             */
 /* ----------------------------------------------------------------------- */
 
-static inline int in_world(int x, int y, int z) {
-    return x >= 0 && x < WORLD_X && y >= 0 && y < WORLD_Y && z >= 0 && z < WORLD_Z;
+/* floor-division and positive modulo (correct for negative coords) */
+static inline int fdiv(int a, int b) { int q = a / b; if ((a % b) && ((a < 0) != (b < 0))) q--; return q; }
+static inline int fmodp(int a, int b) { int r = a % b; if (r < 0) r += b; return r; }
+
+/* the ring cell that currently addresses chunk (cx,cz) */
+static inline Chunk *chunk_cell(int cx, int cz) {
+    return &g_chunks[fmodp(cz, GS) * GS + fmodp(cx, GS)];
 }
+/* the loaded chunk containing world column (x,z), or NULL if not resident */
+static inline Chunk *chunk_of(int x, int z) {
+    int cx = fdiv(x, CH), cz = fdiv(z, CH);
+    Chunk *c = chunk_cell(cx, cz);
+    return (c->valid && c->cx == cx && c->cz == cz) ? c : NULL;
+}
+
 static inline uint8_t get_block(int x, int y, int z) {
-    if (!in_world(x, y, z)) return B_AIR;
-    return g_world[(y * WORLD_Z + z) * WORLD_X + x];
+    if (y < 0 || y >= WORLD_Y) return B_AIR;
+    Chunk *c = chunk_of(x, z);
+    if (!c) return B_AIR;
+    return c->b[(y * CH + fmodp(z, CH)) * CH + fmodp(x, CH)];
 }
 static inline void set_block(int x, int y, int z, uint8_t v) {
-    if (in_world(x, y, z)) g_world[(y * WORLD_Z + z) * WORLD_X + x] = v;
+    if (y < 0 || y >= WORLD_Y) return;
+    Chunk *c = chunk_of(x, z);
+    if (!c) return;
+    c->b[(y * CH + fmodp(z, CH)) * CH + fmodp(x, CH)] = v;
 }
 static inline int is_solid(int x, int y, int z) {
     uint8_t b = get_block(x, y, z);
@@ -190,48 +212,63 @@ static void place_tree(int x, int z, int ground) {
     }
 }
 
-static void gen_world(unsigned seed) {
-    for (unsigned i = 0; i < sizeof(g_world); i++) g_world[i] = B_AIR;
-    float ox = (seed % 997) * 1.3f, oz = (seed % 733) * 1.7f;
+/* terrain height at world column (x,z), deterministic from the seed */
+static int column_height(int x, int z) {
+    float ox = (g_seed % 997) * 1.3f, oz = (g_seed % 733) * 1.7f;
+    float n = fbm((x + ox) * 0.045f, (z + oz) * 0.045f);
+    int h = (int)(14 + n * 30);
+    if (h < 1) h = 1;
+    if (h >= WORLD_Y) h = WORLD_Y - 1;
+    return h;
+}
 
-    for (int x = 0; x < WORLD_X; x++) {
-        for (int z = 0; z < WORLD_Z; z++) {
-            float n = fbm((x + ox) * 0.045f, (z + oz) * 0.045f);
-            int h = (int)(14 + n * 30);
-            if (h < 1) h = 1;
-            if (h >= WORLD_Y) h = WORLD_Y - 1;
+/* Generate chunk (cx,cz) into ring cell c. */
+static void gen_chunk(Chunk *c, int cx, int cz) {
+    c->cx = cx; c->cz = cz; c->valid = 1;
+    memset(c->b, B_AIR, sizeof c->b);
+    for (int lx = 0; lx < CH; lx++)
+        for (int lz = 0; lz < CH; lz++) {
+            int wx = cx * CH + lx, wz = cz * CH + lz;
+            int h = column_height(wx, wz);
             for (int y = 0; y <= h; y++) {
                 uint8_t b;
-                if (y == h) {
-                    if (h <= WATER_LEVEL + 1) b = B_SAND;
-                    else b = B_GRASS;
-                } else if (y >= h - 3) {
-                    b = (h <= WATER_LEVEL + 1) ? B_SAND : B_DIRT;
-                } else {
-                    b = B_STONE;
-                }
-                set_block(x, y, z, b);
+                if (y == h)          b = (h <= WATER_LEVEL + 1) ? B_SAND : B_GRASS;
+                else if (y >= h - 3) b = (h <= WATER_LEVEL + 1) ? B_SAND : B_DIRT;
+                else                 b = B_STONE;
+                c->b[(y * CH + lz) * CH + lx] = b;
             }
-            /* water fill */
-            for (int y = h + 1; y <= WATER_LEVEL; y++) set_block(x, y, z, B_WATER);
+            for (int y = h + 1; y <= WATER_LEVEL; y++)
+                c->b[(y * CH + lz) * CH + lx] = B_WATER;
         }
-    }
-    /* trees on grass above water */
-    for (int x = 3; x < WORLD_X - 3; x++)
-        for (int z = 3; z < WORLD_Z - 3; z++) {
-            /* find surface */
-            int y = WORLD_Y - 1;
-            while (y > 0 && get_block(x, y, z) == B_AIR) y--;
-            if (get_block(x, y, z) == B_GRASS && y > WATER_LEVEL + 1 &&
-                rnd2(x * 13 + 1, z * 17 + 5) < 0.018f)
-                place_tree(x, z, y);
+    /* trees, kept in the chunk interior so canopies never cross a border */
+    for (int lx = 2; lx < CH - 2; lx++)
+        for (int lz = 2; lz < CH - 2; lz++) {
+            int wx = cx * CH + lx, wz = cz * CH + lz;
+            int h = column_height(wx, wz);
+            if (h > WATER_LEVEL + 1 && rnd2(wx * 13 + 1, wz * 17 + 5) < 0.018f)
+                place_tree(wx, wz, h);
         }
+}
 
-    /* spawn on top of terrain at center */
-    int cx = WORLD_X / 2, cz = WORLD_Z / 2, cy = WORLD_Y - 1;
-    while (cy > 0 && get_block(cx, cy, cz) == B_AIR) cy--;
-    g_px = cx + 0.5f; g_pz = cz + 0.5f; g_py = cy + 2.6f;
-    /* ensure we don't spawn inside overhanging leaves/terrain */
+/* Ensure every chunk within LOADR of the player is resident. */
+static void stream_chunks(void) {
+    int pcx = fdiv((int)floorf(g_px), CH), pcz = fdiv((int)floorf(g_pz), CH);
+    for (int dz = -LOADR; dz <= LOADR; dz++)
+        for (int dx = -LOADR; dx <= LOADR; dx++) {
+            int cx = pcx + dx, cz = pcz + dz;
+            Chunk *c = chunk_cell(cx, cz);
+            if (!c->valid || c->cx != cx || c->cz != cz) gen_chunk(c, cx, cz);
+        }
+}
+
+static void gen_world(unsigned seed) {
+    g_seed = seed;
+    for (int i = 0; i < GS * GS; i++) g_chunks[i].valid = 0;
+    g_px = 8.5f; g_pz = 8.5f;
+    stream_chunks();                       /* generate around spawn */
+    int cy = WORLD_Y - 1;
+    while (cy > 0 && get_block(8, cy, 8) == B_AIR) cy--;
+    g_py = cy + 2.6f;
     for (int guard = 0; guard < WORLD_Y && collide(g_px, g_py, g_pz); guard++)
         g_py += 1.0f;
     g_vx = g_vy = g_vz = 0; g_onground = 0;
@@ -414,22 +451,47 @@ static void load_assets(void) {
 /* World save / load (simple RLE-compressed save file)                      */
 /* ----------------------------------------------------------------------- */
 
-static int save_world(const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return 0;
-    fwrite("MCW1", 1, 4, f);
-    int dims[3] = {WORLD_X, WORLD_Y, WORLD_Z};
-    fwrite(dims, sizeof(int), 3, f);
-    float ps[5] = {g_px, g_py, g_pz, g_yaw, g_pitch};
-    fwrite(ps, sizeof(float), 5, f);
-    unsigned i = 0, total = (unsigned)sizeof(g_world);
-    while (i < total) {                     /* run-length encode block ids */
-        uint8_t v = g_world[i];
+/* RLE a byte buffer to file */
+static void rle_write(FILE *f, const uint8_t *buf, unsigned total) {
+    unsigned i = 0;
+    while (i < total) {
+        uint8_t v = buf[i];
         unsigned run = 1;
-        while (i + run < total && g_world[i + run] == v && run < 0xffffffu) run++;
+        while (i + run < total && buf[i + run] == v && run < 0xffffffu) run++;
         fputc(v, f);
         fputc(run & 0xff, f); fputc((run >> 8) & 0xff, f); fputc((run >> 16) & 0xff, f);
         i += run;
+    }
+}
+static int rle_read(FILE *f, uint8_t *buf, unsigned total) {
+    unsigned i = 0;
+    while (i < total) {
+        int v = fgetc(f), b0 = fgetc(f), b1 = fgetc(f), b2 = fgetc(f);
+        if (v < 0 || b2 < 0) break;
+        unsigned run = (unsigned)b0 | ((unsigned)b1 << 8) | ((unsigned)b2 << 16);
+        while (run-- && i < total) buf[i++] = (uint8_t)v;
+    }
+    return i == total;
+}
+
+/* Save the seed, player state, and all currently-loaded chunks. Chunks
+   outside the saved set simply regenerate deterministically from the seed. */
+static int save_world(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    fwrite("MCW2", 1, 4, f);
+    fwrite(&g_seed, sizeof g_seed, 1, f);
+    float ps[5] = {g_px, g_py, g_pz, g_yaw, g_pitch};
+    fwrite(ps, sizeof(float), 5, f);
+    int n = 0;
+    for (int i = 0; i < GS * GS; i++) if (g_chunks[i].valid) n++;
+    fwrite(&n, sizeof n, 1, f);
+    for (int i = 0; i < GS * GS; i++) {
+        Chunk *c = &g_chunks[i];
+        if (!c->valid) continue;
+        fwrite(&c->cx, sizeof c->cx, 1, f);
+        fwrite(&c->cz, sizeof c->cz, 1, f);
+        rle_write(f, c->b, (unsigned)sizeof c->b);
     }
     fclose(f);
     return 1;
@@ -438,23 +500,24 @@ static int save_world(const char *path) {
 static int load_world(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    char magic[4]; int dims[3]; float ps[5];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MCW1", 4) != 0) { fclose(f); return 0; }
-    if (fread(dims, sizeof(int), 3, f) != 3 ||
-        dims[0] != WORLD_X || dims[1] != WORLD_Y || dims[2] != WORLD_Z) { fclose(f); return 0; }
+    char magic[4]; float ps[5]; unsigned seed; int n;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MCW2", 4) != 0) { fclose(f); return 0; }
+    if (fread(&seed, sizeof seed, 1, f) != 1) { fclose(f); return 0; }
     if (fread(ps, sizeof(float), 5, f) != 5) { fclose(f); return 0; }
-    unsigned i = 0, total = (unsigned)sizeof(g_world);
-    while (i < total) {
-        int v = fgetc(f);
-        int b0 = fgetc(f), b1 = fgetc(f), b2 = fgetc(f);
-        if (v < 0 || b2 < 0) break;
-        unsigned run = (unsigned)b0 | ((unsigned)b1 << 8) | ((unsigned)b2 << 16);
-        while (run-- && i < total) g_world[i++] = (uint8_t)v;
+    if (fread(&n, sizeof n, 1, f) != 1) { fclose(f); return 0; }
+    g_seed = seed;
+    for (int i = 0; i < GS * GS; i++) g_chunks[i].valid = 0;
+    for (int k = 0; k < n; k++) {
+        int cx, cz;
+        if (fread(&cx, sizeof cx, 1, f) != 1 || fread(&cz, sizeof cz, 1, f) != 1) { fclose(f); return 0; }
+        Chunk *c = chunk_cell(cx, cz);
+        c->cx = cx; c->cz = cz; c->valid = 1;
+        if (!rle_read(f, c->b, (unsigned)sizeof c->b)) { fclose(f); return 0; }
     }
     fclose(f);
-    if (i != total) return 0;
     g_px = ps[0]; g_py = ps[1]; g_pz = ps[2]; g_yaw = ps[3]; g_pitch = ps[4];
     g_vx = g_vy = g_vz = 0; g_onground = 0;
+    stream_chunks();                 /* fill in any gaps around the player */
     return 1;
 }
 
@@ -527,6 +590,8 @@ static void render_frame(void) {
     float tanf_ = tanf(g_fov * 0.5f * (float)M_PI / 180.0f);
     float aspect = (float)RENDER_W / RENDER_H;
     float maxray = g_render_dist;
+    float loaded = (float)((LOADR - 1) * CH);            /* never ray into unloaded chunks */
+    if (maxray > loaded) maxray = loaded;
     float dl = g_daylight; if (dl < 0.12f) dl = 0.12f;   /* keep a little moonlight */
 
     const uint32_t sky_top = rgb((int)(120 * dl), (int)(170 * dl), (int)(235 * dl));
@@ -887,7 +952,7 @@ static void settings_adjust(int i, int dir) {
     float *p = settings_ptr(i);
     float step[] = {5, 8, 0.05f, 0.1f, 0.1f};
     float lo[]   = {30, 24, 0.05f, 0.3f, 0.1f};
-    float hi[]   = {110, 240, 1.0f, 4.0f, 1.0f};
+    float hi[]   = {110, (LOADR - 1) * CH, 1.0f, 4.0f, 1.0f};
     *p += dir * step[i];
     if (*p < lo[i]) *p = lo[i];
     if (*p > hi[i]) *p = hi[i];
@@ -952,6 +1017,7 @@ static int collide(float ex, float ey, float ez) {
 }
 
 static void update_player(float dt) {
+    stream_chunks();                 /* keep terrain loaded around the player */
     float cy = cosf(g_yaw), sy = sinf(g_yaw);
     /* forward/right on the horizontal plane */
     float fx = sy, fz = cy;

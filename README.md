@@ -28,10 +28,13 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
 - **Settings screen** — FOV, render distance, mouse sensitivity, move speed,
   and daylight, all adjustable live
 - **Day / night** lighting
+- **Chunk-streamed world** — 16×16 chunks generate and unload around the
+  player as you walk, so the world extends effectively without limit in X/Z
+  (including negative coordinates)
 - **Loads real Minecraft-format assets** — reads block textures from a
   standard resource-pack layout (`assets/minecraft/textures/block/*.png`) via
   a self-contained PNG decoder, and builds the world from them
-- Procedurally generated terrain (hills, water, beaches, trees)
+- Procedurally generated, deterministic terrain (hills, water, beaches, trees)
 - First-person movement with gravity, jumping, collision, and a fly mode
 - Break and place blocks; 11 block types with a hotbar
 - **World save/load** — persist and resume your world (`world.sav`)
