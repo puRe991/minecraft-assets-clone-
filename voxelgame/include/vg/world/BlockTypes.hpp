@@ -42,6 +42,9 @@ enum class RenderLayer : uint8_t {
     Transparent   // water — alpha-blended, sorted
 };
 
+// Sound family for footsteps / digging (the audio module maps these to clips).
+enum class SoundGroup : uint8_t { None, Grass, Gravel, Sand, Stone, Wood, Glass, Liquid };
+
 struct BlockType {
     BlockId     id{0};
     std::string name{"air"};
@@ -66,6 +69,7 @@ struct BlockType {
     bool gravity{false};     // falls when unsupported (sand, gravel)
     bool replaceable{false}; // can be overwritten when placing (air, water, grass)
     bool climbable{false};   // the player can climb it (ladders, vines)
+    SoundGroup sound{SoundGroup::Stone};   // footstep / dig sound family
 
     RenderLayer layer{RenderLayer::Opaque};
 

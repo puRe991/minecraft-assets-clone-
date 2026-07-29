@@ -60,8 +60,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 6 | Rendering foundation: lighting (sky/block flood-fill) + greedy meshing | ✅ done, tested |
 | 7 | Items, inventory, crafting & smelting (stacks, durability, recipes, furnace) | ✅ done, tested |
 | 8 | Creatures: entities, AI states, A* pathfinding, spawning rules | ✅ done, tested |
-| 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ next |
-| 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ |
+| 9 | Audio system (footsteps, digging, ambience/weather, music scheduler) | ✅ done, tested |
+| 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ next |
 
 Each row is delivered only after its unit tests pass.
 
@@ -226,3 +226,19 @@ All green; cross-compiles win32/win64.
 Tests: A* straight line, detour around a wall, step-up, no-path-when-enclosed,
 headroom required; entity registry, AI decisions, steering, and spawn light/
 room rules. All green; cross-compiles win32/win64.
+
+## Module 9 — Audio system (done)
+
+**`vg::audio`** — all the "what to play, when" logic behind an `ISoundBackend`
+abstraction (the real WinMM playback lands in the app module):
+- **`SoundRegistry`** + `SoundEvent`; a `RecordingBackend` stub captures plays
+  for tests.
+- **`AudioEngine`**: footsteps chosen by the ground's `SoundGroup` (added to
+  `BlockType` in Module 2) and emitted once per stride with slight pitch
+  variance; break/place dig sounds by material; an ambient bed that changes
+  only when biome/weather changes (rain > cave > wind, looped); and a music
+  scheduler that alternates calm tracks with gaps.
+
+Tests: registry, stride/material footsteps, break/place (liquids silent),
+ambient change + loop + no-op on same env, and music alternation over time.
+All green; cross-compiles win32/win64.

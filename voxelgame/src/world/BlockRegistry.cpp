@@ -39,33 +39,36 @@ void registerDefaultBlocks(BlockRegistry& reg) {
       t.hardness = 1.5f; t.tool = ToolType::Pickaxe; t.harvestTier = Tier::Wood;
       t.requiresTool = true; reg.add(t); }
     { BlockType t = B(Dirt, "dirt");
-      t.hardness = 0.5f; t.tool = ToolType::Shovel; reg.add(t); }
+      t.hardness = 0.5f; t.tool = ToolType::Shovel; t.sound = SoundGroup::Gravel; reg.add(t); }
     { BlockType t = B(Grass, "grass_block");
-      t.hardness = 0.6f; t.tool = ToolType::Shovel; reg.add(t); }
+      t.hardness = 0.6f; t.tool = ToolType::Shovel; t.sound = SoundGroup::Grass; reg.add(t); }
     { BlockType t = B(Sand, "sand");
-      t.hardness = 0.5f; t.tool = ToolType::Shovel; t.gravity = true; reg.add(t); }
+      t.hardness = 0.5f; t.tool = ToolType::Shovel; t.gravity = true; t.sound = SoundGroup::Sand; reg.add(t); }
     { BlockType t = B(Gravel, "gravel");
-      t.hardness = 0.6f; t.tool = ToolType::Shovel; t.gravity = true; reg.add(t); }
+      t.hardness = 0.6f; t.tool = ToolType::Shovel; t.gravity = true; t.sound = SoundGroup::Gravel; reg.add(t); }
     { BlockType t = B(Bedrock, "bedrock");
       t.hardness = -1.0f; reg.add(t); }                       // unbreakable
 
     // --- wood ---
     { BlockType t = B(OakLog, "oak_log");
-      t.hardness = 2.0f; t.tool = ToolType::Axe; reg.add(t); }
+      t.hardness = 2.0f; t.tool = ToolType::Axe; t.sound = SoundGroup::Wood; reg.add(t); }
     { BlockType t = B(OakPlanks, "oak_planks");
-      t.hardness = 2.0f; t.tool = ToolType::Axe; reg.add(t); }
+      t.hardness = 2.0f; t.tool = ToolType::Axe; t.sound = SoundGroup::Wood; reg.add(t); }
     { BlockType t = B(OakLeaves, "oak_leaves");
-      t.hardness = 0.2f; t.lightOpacity = 1; t.layer = RenderLayer::Cutout; reg.add(t); }
+      t.hardness = 0.2f; t.lightOpacity = 1; t.sound = SoundGroup::Grass;
+      t.layer = RenderLayer::Cutout; reg.add(t); }
     { BlockType t = B(Glass, "glass");
-      t.hardness = 0.3f; t.lightOpacity = 0; t.layer = RenderLayer::Cutout; reg.add(t); }
+      t.hardness = 0.3f; t.lightOpacity = 0; t.sound = SoundGroup::Glass;
+      t.layer = RenderLayer::Cutout; reg.add(t); }
 
     // --- fluids ---
     { BlockType t = B(Water, "water");
       t.hardness = 100.0f; t.solid = false; t.fluid = true; t.replaceable = true;
-      t.lightOpacity = 2; t.layer = RenderLayer::Transparent; reg.add(t); }
+      t.lightOpacity = 2; t.sound = SoundGroup::Liquid; t.layer = RenderLayer::Transparent; reg.add(t); }
     { BlockType t = B(Lava, "lava");
       t.hardness = 100.0f; t.solid = false; t.fluid = true; t.replaceable = true;
-      t.lightOpacity = 0; t.lightEmission = 15; t.layer = RenderLayer::Transparent; reg.add(t); }
+      t.lightOpacity = 0; t.lightEmission = 15; t.sound = SoundGroup::Liquid;
+      t.layer = RenderLayer::Transparent; reg.add(t); }
 
     // --- ores (require progressively better pickaxes) ---
     { BlockType t = B(CoalOre, "coal_ore");
@@ -84,12 +87,12 @@ void registerDefaultBlocks(BlockRegistry& reg) {
     // --- light source ---
     { BlockType t = B(Torch, "torch");
       t.hardness = 0.0f; t.solid = false; t.lightOpacity = 0; t.lightEmission = 14;
-      t.layer = RenderLayer::Cutout; reg.add(t); }
+      t.sound = SoundGroup::Wood; t.layer = RenderLayer::Cutout; reg.add(t); }
 
     // --- climbable ---
     { BlockType t = B(Ladder, "ladder");
       t.hardness = 0.4f; t.tool = ToolType::Axe; t.solid = false; t.lightOpacity = 0;
-      t.climbable = true; t.layer = RenderLayer::Cutout; reg.add(t); }
+      t.climbable = true; t.sound = SoundGroup::Wood; t.layer = RenderLayer::Cutout; reg.add(t); }
 
     // --- cobblestone (what stone drops as; smelts back into stone) ---
     { BlockType t = B(Cobblestone, "cobblestone");
