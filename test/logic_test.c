@@ -102,6 +102,25 @@ tex_done:
     do_place();
     printf("break/place: ok (no crash)\n");
 
+    /* --- world save/load round-trip --- */
+    gen_world(123);
+    set_block(10, 40, 10, B_GLASS);
+    set_block(11, 40, 10, B_PLANKS);
+    g_px = 12.5f; g_py = 45.0f; g_pz = 9.5f; g_yaw = 1.23f; g_pitch = -0.4f;
+    uint8_t snapshot[64]; for (int i = 0; i < 64; i++) snapshot[i] = g_world[i * 137 % (int)sizeof(g_world)];
+    const char *sav = "/tmp/claude-0/-home-user-minecraft-assets-clone-/3dbf0045-846a-5245-96cd-022269b286fa/scratchpad/test.sav";
+    if (!save_world(sav)) { printf("FAIL: save_world\n"); fails++; }
+    /* clobber the world, then load it back */
+    for (unsigned i = 0; i < sizeof(g_world); i++) g_world[i] = B_STONE;
+    g_px = g_py = g_pz = g_yaw = g_pitch = 0;
+    if (!load_world(sav)) { printf("FAIL: load_world\n"); fails++; }
+    int mism = 0;
+    for (int i = 0; i < 64; i++) if (g_world[i * 137 % (int)sizeof(g_world)] != snapshot[i]) mism++;
+    if (get_block(10, 40, 10) != B_GLASS || get_block(11, 40, 10) != B_PLANKS) mism++;
+    if (mism) { printf("FAIL: save/load world mismatch (%d)\n", mism); fails++; }
+    if (g_px != 12.5f || g_py != 45.0f || g_yaw != 1.23f) { printf("FAIL: save/load player state\n"); fails++; }
+    printf("world save/load: %s\n", mism ? "BAD" : "ok");
+
     /* --- render a frame, verify framebuffer fully written --- */
     render_frame();
     if (!check_framebuf_valid()) { printf("FAIL: framebuffer has unwritten pixels\n"); fails++; }

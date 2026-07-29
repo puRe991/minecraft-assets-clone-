@@ -25,7 +25,8 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
   a self-contained PNG decoder, and builds the world from them
 - Procedurally generated terrain (hills, water, beaches, trees)
 - First-person movement with gravity, jumping, collision, and a fly mode
-- Break and place blocks; 11 block types
+- Break and place blocks; 11 block types with a hotbar
+- **World save/load** — persist and resume your world (`world.sav`)
 - Software raycasting renderer with per-face lighting and distance fog
 - Runs on old hardware — no GPU or OpenGL required
 
@@ -62,9 +63,13 @@ procedurally generated texture for that block, so it always runs.
 | `F` | Toggle fly mode |
 | Left mouse | Break block |
 | Right mouse | Place block |
-| `1`–`9`, `0` | Select block to place |
+| `1`–`9`, `0` | Select block to place (hotbar) |
+| `K` / `L` | Save / load the world (`world.sav`) |
 | `R` | Regenerate the world |
 | `Esc` | Quit |
+
+A saved world (`world.sav`) is written next to the game and is loaded
+automatically on the next launch.
 
 ## Building from source
 

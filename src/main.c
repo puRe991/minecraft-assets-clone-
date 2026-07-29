@@ -13,7 +13,8 @@
  *   F                toggle fly mode
  *   Left mouse       break block
  *   Right mouse      place block
- *   1..9             select block to place
+ *   1..9, 0          select block to place
+ *   K / L            save / load the world (world.sav)
  *   R                regenerate the world
  *   Esc              quit
  *
@@ -382,6 +383,54 @@ static void load_assets(void) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* World save / load (simple RLE-compressed save file)                      */
+/* ----------------------------------------------------------------------- */
+
+static int save_world(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    fwrite("MCW1", 1, 4, f);
+    int dims[3] = {WORLD_X, WORLD_Y, WORLD_Z};
+    fwrite(dims, sizeof(int), 3, f);
+    float ps[5] = {g_px, g_py, g_pz, g_yaw, g_pitch};
+    fwrite(ps, sizeof(float), 5, f);
+    unsigned i = 0, total = (unsigned)sizeof(g_world);
+    while (i < total) {                     /* run-length encode block ids */
+        uint8_t v = g_world[i];
+        unsigned run = 1;
+        while (i + run < total && g_world[i + run] == v && run < 0xffffffu) run++;
+        fputc(v, f);
+        fputc(run & 0xff, f); fputc((run >> 8) & 0xff, f); fputc((run >> 16) & 0xff, f);
+        i += run;
+    }
+    fclose(f);
+    return 1;
+}
+
+static int load_world(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char magic[4]; int dims[3]; float ps[5];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MCW1", 4) != 0) { fclose(f); return 0; }
+    if (fread(dims, sizeof(int), 3, f) != 3 ||
+        dims[0] != WORLD_X || dims[1] != WORLD_Y || dims[2] != WORLD_Z) { fclose(f); return 0; }
+    if (fread(ps, sizeof(float), 5, f) != 5) { fclose(f); return 0; }
+    unsigned i = 0, total = (unsigned)sizeof(g_world);
+    while (i < total) {
+        int v = fgetc(f);
+        int b0 = fgetc(f), b1 = fgetc(f), b2 = fgetc(f);
+        if (v < 0 || b2 < 0) break;
+        unsigned run = (unsigned)b0 | ((unsigned)b1 << 8) | ((unsigned)b2 << 16);
+        while (run-- && i < total) g_world[i++] = (uint8_t)v;
+    }
+    fclose(f);
+    if (i != total) return 0;
+    g_px = ps[0]; g_py = ps[1]; g_pz = ps[2]; g_yaw = ps[3]; g_pitch = ps[4];
+    g_vx = g_vy = g_vz = 0; g_onground = 0;
+    return 1;
+}
+
+/* ----------------------------------------------------------------------- */
 /* Camera / rays                                                            */
 /* ----------------------------------------------------------------------- */
 
@@ -513,10 +562,27 @@ static void render_frame(void) {
         g_framebuf[(cyp + i) * RENDER_W + cxp] ^= 0x00ffffff;
     }
 
-    /* selected-block swatch (top-left) */
-    for (int y = 4; y < 24; y++)
-        for (int x = 4; x < 24; x++)
-            g_framebuf[y * RENDER_W + x] = g_tex[g_selected][1][(y % TEX) * TEX + (x % TEX)];
+    /* hotbar: block ids 1..10 (GLASS = 10), selected slot highlighted */
+    {
+        const int slots = 10, sw = 22, gap = 2;
+        int tot = slots * (sw + gap) - gap;
+        int x0 = (RENDER_W - tot) / 2, y0 = RENDER_H - sw - 6;
+        for (int k = 0; k < slots; k++) {
+            int blk = k + 1;
+            int sxp = x0 + k * (sw + gap);
+            int sel = (blk == g_selected);
+            for (int yy = -2; yy < sw + 2; yy++)
+                for (int xx = -2; xx < sw + 2; xx++) {
+                    int px = sxp + xx, py = y0 + yy;
+                    if (px < 0 || px >= RENDER_W || py < 0 || py >= RENDER_H) continue;
+                    if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
+                        g_framebuf[py * RENDER_W + px] = sel ? 0xffffffffu : 0xff202020u;
+                    else
+                        g_framebuf[py * RENDER_W + px] =
+                            g_tex[blk][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)];
+                }
+        }
+    }
 }
 
 /* ----------------------------------------------------------------------- */
@@ -619,6 +685,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == VK_ESCAPE) { g_running = 0; PostQuitMessage(0); }
         if (w == 'F') g_fly = !g_fly;
         if (w == 'R') gen_world((unsigned)GetTickCount());
+        if (w == 'K') save_world("world.sav");
+        if (w == 'L') load_world("world.sav");
         if (w >= '1' && w <= '9') {
             int idx = (int)w - '0';          /* 1..9 -> block ids 1..9 */
             if (idx < B_COUNT) g_selected = idx;
@@ -666,6 +734,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
     gen_textures();
     load_assets();
     gen_world((unsigned)GetTickCount());
+    load_world("world.sav");   /* resume a saved world if one exists */
 
     {
         char title[128];
