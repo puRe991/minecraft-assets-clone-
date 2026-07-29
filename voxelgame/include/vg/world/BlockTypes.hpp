@@ -24,7 +24,7 @@ enum : BlockId {
     OakLog, OakPlanks, OakLeaves, Glass,
     Water, Lava,
     CoalOre, IronOre, GoldOre, DiamondOre,
-    Torch,
+    Torch, Ladder,
     Count
 };
 }  // namespace blocks
@@ -65,6 +65,7 @@ struct BlockType {
     bool fluid{false};       // flows; non-solid; special rendering
     bool gravity{false};     // falls when unsupported (sand, gravel)
     bool replaceable{false}; // can be overwritten when placing (air, water, grass)
+    bool climbable{false};   // the player can climb it (ladders, vines)
 
     RenderLayer layer{RenderLayer::Opaque};
 

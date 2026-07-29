@@ -56,8 +56,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 2 | Block registry (hardness, tool tier, transparency, light, fluid, gravity) | ✅ done, tested |
 | 3 | Chunk & world storage (infinite streaming) | ✅ done, tested |
 | 4 | Terrain: biomes, caves, rivers/oceans, ores, vegetation, structures | ✅ done, tested |
-| 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ⏳ next |
-| 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ |
+| 5 | Physics & first-person controls (sprint, jump, crouch, swim, climb, collision) | ✅ done, tested |
+| 6 | Rendering & lighting (sunlight, dynamic lights, smooth lighting) | ⏳ next |
 | 7 | Inventory & crafting (hotbar, recipes, stacks, durability, chests/furnaces) | ⏳ |
 | 8 | Creatures (passive/neutral/hostile, pathfinding, spawning) | ⏳ |
 | 9 | Audio (footsteps, ambience, weather, interactions, music) | ⏳ |
@@ -145,3 +145,23 @@ Tests: determinism, ground+sky, biome variety + land/water, caves exist, ores
 appear only where they should (diamonds only below y=14), and trees appear in
 forests but never on desert sand. `tools/visualize.cpp` renders a top-down
 biome map and a vertical cross-section (caves/ores/water) to PNG.
+
+## Module 5 — Physics & first-person controls (done)
+
+**`vg::physics::PlayerController`** — moves a player-sized AABB through the
+voxel world with per-axis collide-and-resolve. It reads block data from the
+`World` and block properties from the `BlockRegistry` (no rendering/input
+coupling). Supports:
+
+- **Walking / sprinting / crouching** at different speeds, movement relative
+  to the look yaw.
+- **Jumping** (only when grounded) with gravity and a terminal velocity.
+- **Swimming** — buoyant, reduced-gravity motion when the box is in a fluid.
+- **Climbing** — clinging to climbable blocks (a `Ladder` block was added to
+  the registry, with a `climbable` flag on `BlockType`).
+- **Sneak edge protection** — crouching while grounded cancels a horizontal
+  step that would leave the player over empty space (you can lean, not fall).
+
+Tests: gravity settling, walking + wall stop, sprint > walk, jump rise+land,
+swimming slows the fall, ladder climbing, and sneak-doesn't-fall (vs. walking
+which does). All green; cross-compiles win32/win64.

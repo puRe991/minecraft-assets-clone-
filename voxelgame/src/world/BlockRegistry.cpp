@@ -85,6 +85,11 @@ void registerDefaultBlocks(BlockRegistry& reg) {
     { BlockType t = B(Torch, "torch");
       t.hardness = 0.0f; t.solid = false; t.lightOpacity = 0; t.lightEmission = 14;
       t.layer = RenderLayer::Cutout; reg.add(t); }
+
+    // --- climbable ---
+    { BlockType t = B(Ladder, "ladder");
+      t.hardness = 0.4f; t.tool = ToolType::Axe; t.solid = false; t.lightOpacity = 0;
+      t.climbable = true; t.layer = RenderLayer::Cutout; reg.add(t); }
 }
 
 }  // namespace vg::world
