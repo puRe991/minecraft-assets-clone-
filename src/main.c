@@ -26,6 +26,8 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include "png.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -293,6 +295,90 @@ static void gen_textures(void) {
                 g_tex[B_GLASS][f][y * TEX + x] = edge ? rgb(200, 220, 230) : rgb(170, 200, 215);
             }
     }
+}
+
+/* ----------------------------------------------------------------------- */
+/* Asset loading (Minecraft-format resource pack)                           */
+/*                                                                          */
+/* At startup the game looks for real textures under                        */
+/*   assets/minecraft/textures/block/<name>.png                             */
+/* and uses them in place of the procedural fallback. Grayscale textures    */
+/* that Minecraft tints by biome (grass, leaves) get a tint applied here,   */
+/* so a stock Minecraft resource pack renders with sensible colours.        */
+/* ----------------------------------------------------------------------- */
+
+struct texref { const char *name; uint32_t tint; };   /* tint 0 = none */
+
+static const struct texref g_texmap[B_COUNT][3] = {
+    /*            top                              side                          bottom            */
+    [B_GRASS]  = {{"grass_block_top", 0x91BD59}, {"grass_block_side", 0},     {"dirt", 0}},
+    [B_DIRT]   = {{"dirt", 0},                   {"dirt", 0},                 {"dirt", 0}},
+    [B_STONE]  = {{"stone", 0},                  {"stone", 0},                {"stone", 0}},
+    [B_COBBLE] = {{"cobblestone", 0},            {"cobblestone", 0},          {"cobblestone", 0}},
+    [B_LOG]    = {{"oak_log_top", 0},            {"oak_log", 0},              {"oak_log_top", 0}},
+    [B_LEAVES] = {{"oak_leaves", 0x59AE30},      {"oak_leaves", 0x59AE30},    {"oak_leaves", 0x59AE30}},
+    [B_SAND]   = {{"sand", 0},                   {"sand", 0},                 {"sand", 0}},
+    [B_PLANKS] = {{"oak_planks", 0},             {"oak_planks", 0},           {"oak_planks", 0}},
+    [B_WATER]  = {{"water_still", 0},            {"water_still", 0},          {"water_still", 0}},
+    [B_GLASS]  = {{"glass", 0},                  {"glass", 0},                {"glass", 0}},
+};
+
+static int g_assets_loaded = 0;   /* number of textures loaded from disk */
+
+static void apply_tint(uint32_t *t, uint32_t tint) {
+    if (!tint) return;
+    int tr = (tint >> 16) & 0xff, tg = (tint >> 8) & 0xff, tb = tint & 0xff;
+    for (int i = 0; i < TEX * TEX; i++) {
+        uint32_t c = t[i];
+        int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+        t[i] = 0xff000000u | (((r * tr) / 255) << 16) | (((g * tg) / 255) << 8) | ((b * tb) / 255);
+    }
+}
+
+static int load_one(const char *base, int blk, int face, uint32_t tint) {
+    const char *name = g_texmap[blk][face].name;
+    if (!name) return 0;
+    char path[600];
+    snprintf(path, sizeof path, "%sassets/minecraft/textures/block/%s.png", base, name);
+    int w, h;
+    uint32_t *img = png_load(path, &w, &h);
+    if (!img) return 0;
+    int frame_h = (h >= w) ? w : h;       /* animated strips: use first frame */
+    for (int y = 0; y < TEX; y++)
+        for (int x = 0; x < TEX; x++) {
+            int sx = x * w / TEX;
+            int sy = y * frame_h / TEX;
+            if (sx >= w) sx = w - 1;
+            if (sy >= h) sy = h - 1;
+            g_tex[blk][face][y * TEX + x] = img[sy * w + sx] | 0xff000000u;
+        }
+    free(img);
+    apply_tint(g_tex[blk][face], tint);
+    return 1;
+}
+
+static void load_assets(void) {
+    const char *bases[4];
+    int nb = 0;
+#ifndef HEADLESS_TEST
+    static char exedir[600];
+    DWORD n = GetModuleFileNameA(NULL, exedir, sizeof exedir);
+    if (n > 0 && n < sizeof exedir) {
+        for (int i = (int)n - 1; i >= 0; i--)
+            if (exedir[i] == '\\' || exedir[i] == '/') { exedir[i + 1] = 0; break; }
+        bases[nb++] = exedir;
+    }
+#endif
+    bases[nb++] = "";       /* current working directory */
+    bases[nb++] = "../";    /* running from dist/ next to repo root */
+
+    g_assets_loaded = 0;
+    for (int b = B_GRASS; b < B_COUNT; b++)
+        for (int f = 0; f < 3; f++) {
+            if (!g_texmap[b][f].name) continue;
+            for (int bi = 0; bi < nb; bi++)
+                if (load_one(bases[bi], b, f, g_texmap[b][f].tint)) { g_assets_loaded++; break; }
+        }
 }
 
 /* ----------------------------------------------------------------------- */
@@ -578,7 +664,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
     UpdateWindow(g_hwnd);
 
     gen_textures();
+    load_assets();
     gen_world((unsigned)GetTickCount());
+
+    {
+        char title[128];
+        snprintf(title, sizeof title,
+                 "MiniCraft - voxel sandbox (32/64-bit)  |  %d textures from assets",
+                 g_assets_loaded);
+        SetWindowTextA(g_hwnd, title);
+    }
 
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);

@@ -30,6 +30,15 @@ int main(void) {
 tex_done:
     printf("textures generated: %s\n", fails ? "BAD" : "ok");
 
+    /* --- asset loading: load the exported resource pack --- */
+    load_assets();
+    if (g_assets_loaded < 30) {   /* 10 blocks x 3 faces, all mapped */
+        printf("FAIL: only %d/30 texture slots loaded from assets/\n", g_assets_loaded);
+        fails++;
+    }
+    printf("assets loaded from PNG: %d/30 face slots (12 files)  %s\n", g_assets_loaded,
+           g_assets_loaded >= 30 ? "ok" : "BAD");
+
     /* --- worldgen: several seeds, sanity of block values & solid ground --- */
     for (unsigned seed = 1; seed <= 5; seed++) {
         gen_world(seed);
