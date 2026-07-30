@@ -150,6 +150,26 @@ tex_done:
     if (g_health <= 0)  { printf("FAIL: non-lethal drop killed the player\n"); fails++; }
     printf("fall damage (hp=%d after ~7-block drop): %s\n", g_health, fails ? "BAD" : "ok");
 
+    /* --- audio synthesis: bounded, non-silent, reacts to events --- */
+    {
+        static int16_t abuf[1024 * 2];
+        audio_set_biome(BIO_FOREST, 0);
+        long nonzero = 0; int inrange = 1;
+        for (int block = 0; block < 60; block++) {          /* ~3 s of audio */
+            if (block == 20) audio_sfx(2);                  /* a break sound */
+            if (block == 40) audio_set_biome(BIO_DESERT, 0);
+            audio_synth(abuf, 1024);
+            for (int i = 0; i < 1024 * 2; i++) {
+                if (abuf[i] != 0) nonzero++;
+                /* int16 is inherently in range; assert the synth didn't wrap oddly */
+                if (abuf[i] == -32768) inrange = 0;
+            }
+        }
+        if (!inrange) { printf("FAIL: audio sample out of range\n"); fails++; }
+        if (nonzero < 1000) { printf("FAIL: audio essentially silent (%ld)\n", nonzero); fails++; }
+        printf("audio synthesis (bounded, non-silent): %s\n", fails ? "BAD" : "ok");
+    }
+
     /* --- world save/load round-trip --- */
     gen_world(123);
     set_block(10, 40, 10, B_GLASS);

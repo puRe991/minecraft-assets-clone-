@@ -23,6 +23,7 @@
 
 #ifndef HEADLESS_TEST
 #include <windows.h>
+#include <mmsystem.h>
 #endif
 #include <math.h>
 #include <stdint.h>
@@ -1554,6 +1555,96 @@ static void do_place(void) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* Procedural audio (synthesis is platform-independent + testable)          */
+/*                                                                          */
+/* Nothing is loaded from disk: ambience is filtered noise, music is a calm */
+/* pentatonic sine sequencer, and block sounds are short synthesized bursts.*/
+/* ----------------------------------------------------------------------- */
+#define AUDIO_RATE 22050
+
+static unsigned g_arng = 0x1234567u;
+static float arand(void) {                 /* white noise in [-1,1] */
+    g_arng = g_arng * 1664525u + 1013904223u;
+    return ((int)(g_arng >> 8) & 0xffff) / 32768.0f - 1.0f;
+}
+
+/* ambient bed */
+static float g_amb_lp = 0, g_amb_vol = 0, g_amb_target = 0, g_amb_coef = 0.06f;
+/* music sequencer */
+static double g_mus_t = 0, g_mus_next = 1.0, g_note_phase = 0;
+static float  g_note_freq = 220, g_note_env = 0;
+static unsigned g_mus_rng = 99;
+/* one short sfx voice */
+static float  g_sfx_env = 0, g_sfx_decay = 0.999f, g_sfx_freq = 440;
+static double g_sfx_phase = 0;
+static int    g_sfx_type = 0;              /* 0 none, 1 step, 2 break, 3 place */
+
+/* Set the ambient character from the player's biome / whether underground. */
+static void audio_set_biome(int biome, int underground) {
+    if (underground) { g_amb_target = 0.10f; g_amb_coef = 0.015f; return; }
+    switch (biome) {
+        case BIO_DESERT: case BIO_BADLANDS:   g_amb_target = 0.09f; g_amb_coef = 0.20f; break;
+        case BIO_MOUNTAINS:                   g_amb_target = 0.12f; g_amb_coef = 0.12f; break;
+        case BIO_OCEAN: case BIO_FROZEN_OCEAN:
+        case BIO_BEACH: case BIO_SWAMP:       g_amb_target = 0.08f; g_amb_coef = 0.05f; break;
+        case BIO_SNOWY: case BIO_TAIGA:       g_amb_target = 0.05f; g_amb_coef = 0.10f; break;
+        case BIO_JUNGLE: case BIO_FOREST:
+        case BIO_DARK_FOREST:                 g_amb_target = 0.06f; g_amb_coef = 0.04f; break;
+        default:                              g_amb_target = 0.05f; g_amb_coef = 0.08f; break;
+    }
+}
+
+static void audio_sfx(int type) {
+    g_sfx_type = type; g_sfx_env = 1.0f;
+    if (type == 1) { g_sfx_freq = 200; g_sfx_decay = 0.9975f; }        /* footstep thud */
+    else if (type == 2) { g_sfx_freq = 320; g_sfx_decay = 0.9990f; }   /* break */
+    else { g_sfx_freq = 520; g_sfx_decay = 0.9985f; }                  /* place click */
+}
+
+/* pentatonic note table (A minor pentatonic across two octaves) */
+static const float PENTA[10] = {220.0f, 261.6f, 293.7f, 329.6f, 392.0f,
+                                440.0f, 523.3f, 587.3f, 659.3f, 784.0f};
+
+/* Fill `frames` stereo 16-bit samples, advancing all synth state. */
+static void audio_synth(int16_t *out, int frames) {
+    const float dt = 1.0f / AUDIO_RATE;
+    for (int i = 0; i < frames; i++) {
+        /* ambient: lowpass-filtered noise, volume ramped toward the target */
+        g_amb_vol += (g_amb_target - g_amb_vol) * 0.0004f;
+        float n = arand();
+        g_amb_lp += (n - g_amb_lp) * g_amb_coef;
+        float amb = g_amb_lp * g_amb_vol;
+
+        /* music: schedule a new calm note, sine with a soft decay envelope */
+        g_mus_t += dt;
+        if (g_mus_t >= g_mus_next) {
+            g_mus_rng = g_mus_rng * 1103515245u + 12345u;
+            g_note_freq = PENTA[(g_mus_rng >> 16) % 10];
+            g_note_env = 0.9f;
+            g_note_phase = 0;
+            g_mus_next = g_mus_t + 1.6 + ((g_mus_rng >> 8) & 0xff) / 255.0 * 2.0; /* 1.6..3.6s */
+        }
+        g_note_env *= 0.99985f;                    /* slow release */
+        float mus = sinf((float)g_note_phase) * g_note_env * 0.10f;
+        g_note_phase += 2.0 * M_PI * g_note_freq * dt;
+
+        /* sfx: one short voice */
+        float sx = 0;
+        if (g_sfx_env > 0.001f) {
+            if (g_sfx_type == 1) sx = (g_amb_lp + arand() * 0.5f) * g_sfx_env * 0.5f;  /* noisy step */
+            else { sx = sinf((float)g_sfx_phase) * g_sfx_env * 0.4f; g_sfx_freq *= 0.9997f; }
+            g_sfx_phase += 2.0 * M_PI * g_sfx_freq * dt;
+            g_sfx_env *= g_sfx_decay;
+        }
+
+        float s = amb + mus + sx;
+        if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+        int16_t v = (int16_t)(s * 30000.0f);
+        out[i * 2] = v; out[i * 2 + 1] = v;         /* mono -> both channels */
+    }
+}
+
+/* ----------------------------------------------------------------------- */
 /* Win32 plumbing                                                           */
 /* ----------------------------------------------------------------------- */
 #ifndef HEADLESS_TEST
@@ -1665,6 +1756,46 @@ static void click_to_internal(int *ix, int *iy) {
     *iy = g_client_h ? g_click_y * RENDER_H / g_client_h : 0;
 }
 
+/* ---- waveOut streaming (double-buffered, polled from the main loop) ---- */
+#define AUD_BUFS 4
+#define AUD_FRAMES 1024
+static HWAVEOUT g_wo = NULL;
+static WAVEHDR  g_whdr[AUD_BUFS];
+static int16_t  g_abuf[AUD_BUFS][AUD_FRAMES * 2];
+static int      g_audio_ok = 0;
+
+static void audio_init(void) {
+    WAVEFORMATEX wf = {0};
+    wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = 2; wf.nSamplesPerSec = AUDIO_RATE;
+    wf.wBitsPerSample = 16; wf.nBlockAlign = 4; wf.nAvgBytesPerSec = AUDIO_RATE * 4;
+    if (waveOutOpen(&g_wo, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_audio_ok = 0; return;                 /* no device: run silently */
+    }
+    for (int i = 0; i < AUD_BUFS; i++) {
+        memset(&g_whdr[i], 0, sizeof(WAVEHDR));
+        g_whdr[i].lpData = (LPSTR)g_abuf[i];
+        g_whdr[i].dwBufferLength = AUD_FRAMES * 2 * sizeof(int16_t);
+        waveOutPrepareHeader(g_wo, &g_whdr[i], sizeof(WAVEHDR));
+        audio_synth(g_abuf[i], AUD_FRAMES);
+        waveOutWrite(g_wo, &g_whdr[i], sizeof(WAVEHDR));
+    }
+    g_audio_ok = 1;
+}
+static void audio_update(void) {
+    if (!g_audio_ok) return;
+    for (int i = 0; i < AUD_BUFS; i++)
+        if (g_whdr[i].dwFlags & WHDR_DONE) {
+            audio_synth(g_abuf[i], AUD_FRAMES);
+            waveOutWrite(g_wo, &g_whdr[i], sizeof(WAVEHDR));
+        }
+}
+static void audio_shutdown(void) {
+    if (!g_audio_ok) return;
+    waveOutReset(g_wo);
+    for (int i = 0; i < AUD_BUFS; i++) waveOutUnprepareHeader(g_wo, &g_whdr[i], sizeof(WAVEHDR));
+    waveOutClose(g_wo);
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
     (void)hPrev; (void)cmd;
 
@@ -1704,6 +1835,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
 
     int mouse_init = 0;
     HDC hdc = GetDC(g_hwnd);
+    audio_init();
+    float step_accum = 0; double last_px = g_px, last_pz = g_pz;
 
     while (g_running) {
         MSG msg;
@@ -1712,6 +1845,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
             DispatchMessage(&msg);
         }
         if (!g_running) break;
+
+        audio_update();
+        {   /* ambient character from the player's biome / being underground */
+            int bx = (int)floorf(g_px), bz = (int)floorf(g_pz);
+            int surf = surface_height(bx, bz);
+            audio_set_biome(biome_at(bx, bz), g_py < surf - 2);
+        }
 
         QueryPerformanceCounter(&now);
         float dt = (float)(now.QuadPart - prev.QuadPart) / freq.QuadPart;
@@ -1807,12 +1947,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
                 if (g_esc) { g_esc = 0; g_paused = 0; }
             } else {
                 if (g_esc) { g_esc = 0; g_paused = 1; g_menu_sel = 0; }
-                if (g_break_req) { do_break(); g_break_req = 0; }
-                if (g_place_req) { do_place(); g_place_req = 0; }
+                if (g_break_req) { do_break(); g_break_req = 0; audio_sfx(2); }
+                if (g_place_req) { do_place(); g_place_req = 0; audio_sfx(3); }
                 update_player(dt);
                 g_tod += dt / g_daylen;             /* advance day/night cycle */
                 if (g_tod >= 1.0f) g_tod -= 1.0f;
                 g_daylight = daylight_from_tod(g_tod);
+                /* footsteps: one every ~1.7 units while walking on the ground */
+                double mdx = g_px - last_px, mdz = g_pz - last_pz;
+                if (g_onground) step_accum += (float)sqrt(mdx * mdx + mdz * mdz);
+                if (step_accum > 1.7f) { audio_sfx(1); step_accum = 0; }
+                last_px = g_px; last_pz = g_pz;
             }
 
             render_frame();
@@ -1834,6 +1979,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
                       g_framebuf, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
 
+    audio_shutdown();
     ReleaseDC(g_hwnd, hdc);
     return 0;
 }
