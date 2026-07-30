@@ -45,6 +45,25 @@ public:
         auto it = chunks_.find(c);
         return it == chunks_.end() ? nullptr : it->second.get();
     }
+    Chunk* mutableChunk(ChunkCoord c) {
+        auto it = chunks_.find(c);
+        return it == chunks_.end() ? nullptr : it->second.get();
+    }
+
+    // Coordinates of all loaded chunks (for saving/iteration).
+    std::vector<ChunkCoord> loadedCoords() const {
+        std::vector<ChunkCoord> v; v.reserve(chunks_.size());
+        for (const auto& kv : chunks_) v.push_back(kv.first);
+        return v;
+    }
+
+    // Insert (or replace) a chunk that was loaded from disk.
+    Chunk& putChunk(std::unique_ptr<Chunk> c) {
+        ChunkCoord pos = c->pos();
+        Chunk& ref = *c;
+        chunks_[pos] = std::move(c);
+        return ref;
+    }
 
 private:
     std::shared_ptr<IChunkGenerator> gen_;

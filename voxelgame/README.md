@@ -61,7 +61,8 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 7 | Items, inventory, crafting & smelting (stacks, durability, recipes, furnace) | ✅ done, tested |
 | 8 | Creatures: entities, AI states, A* pathfinding, spawning rules | ✅ done, tested |
 | 9 | Audio system (footsteps, digging, ambience/weather, music scheduler) | ✅ done, tested |
-| 10 | Persistence (chunk-based save/load, compression, autosave) | ⏳ next |
+| 10 | Persistence: chunk save/load, RLE compression, autosave | ✅ done, tested |
+| — | App module: window + software rasterizer that assembles all the above | ⏳ next |
 
 Each row is delivered only after its unit tests pass.
 
@@ -242,3 +243,29 @@ abstraction (the real WinMM playback lands in the app module):
 Tests: registry, stride/material footsteps, break/place (liquids silent),
 ambient change + loop + no-op on same env, and music alternation over time.
 All green; cross-compiles win32/win64.
+
+## Module 10 — Persistence (done)
+
+**`vg::save`** — saving/loading a world, dependency-free and portable
+(`<fstream>`/`<filesystem>`, little-endian byte format):
+- **`ChunkCodec`**: serialize a chunk to bytes with **run-length compression**
+  of the block ids (a near-empty chunk shrinks to <10% of raw) and read it
+  back exactly.
+- **`WorldSaver`**: one file per chunk (`c.<x>.<z>.chunk`) plus a `level.dat`
+  (seed + player position). `saveDirty` writes only player-modified chunks and
+  clears their dirty flag; `loadInto` restores chunks from disk (unsaved
+  chunks simply regenerate from the seed).
+- **`AutoSaver`**: fires on a fixed interval.
+
+Tests: codec round-trip (incl. edited/negative-coord chunks), RLE actually
+compresses, malformed buffers rejected, full world save→reload keeps player
+edits, dirty-flag lifecycle, and autosave timing. All green; cross-compiles
+win32/win64.
+
+---
+
+**Core engine status: 10/10 modules complete**, 83 unit-test cases, all green,
+every module cross-compiling for Windows 32- and 64-bit. What remains is the
+**app module**: the Win32 window, input loop, and software rasterizer that wire
+these systems together into a runnable `.exe`. (The MiniCraft prototype in the
+repo root is already a complete, playable Windows build in this style.)
