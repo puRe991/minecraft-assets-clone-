@@ -62,6 +62,9 @@
 enum {
     B_AIR = 0, B_GRASS, B_DIRT, B_STONE, B_COBBLE,
     B_LOG, B_LEAVES, B_SAND, B_PLANKS, B_WATER, B_GLASS,
+    /* biome blocks */
+    B_SNOW, B_ICE, B_RED_SAND, B_TERRACOTTA, B_DRY_GRASS, B_PODZOL,
+    B_MYCELIUM, B_SPRUCE_LEAVES, B_JUNGLE_LEAVES, B_BIRCH_LOG, B_CACTUS,
     B_COUNT
 };
 
@@ -222,31 +225,129 @@ static float fbm(float x, float y) {
 
 static int collide(float ex, float ey, float ez);   /* forward decl */
 
-static void place_tree(int x, int z, int ground) {
-    int h = 4 + (int)(rnd2(x * 7, z * 3) * 3.0f);
-    for (int i = 1; i <= h; i++) set_block(x, ground + i, z, B_LOG);
+/* A tree of a given wood/leaf type. `conical` makes a spruce-style shape;
+   otherwise a rounded (oak/birch/jungle) canopy. Kept within the chunk. */
+static void place_tree_type(int x, int z, int ground, uint8_t logb, uint8_t leafb,
+                            int minH, int randH, int conical) {
+    int h = minH + (int)(rnd2(x * 7, z * 3) * randH);
+    for (int i = 1; i <= h; i++) set_block(x, ground + i, z, logb);
     int top = ground + h;
-    for (int dy = -1; dy <= 2; dy++) {
-        int r = (dy <= 0) ? 2 : 1;
-        for (int dx = -r; dx <= r; dx++)
-            for (int dz = -r; dz <= r; dz++) {
-                if (dx == 0 && dz == 0 && dy <= 0) continue;
-                if (abs(dx) == r && abs(dz) == r && (rnd2(x + dx, z + dz) < 0.4f)) continue;
-                int yy = top + dy;
-                if (get_block(x + dx, yy, z + dz) == B_AIR)
-                    set_block(x + dx, yy, z + dz, B_LEAVES);
-            }
+    if (conical) {
+        for (int dy = 0; dy <= h - 2; dy++) {
+            int level = top - dy;
+            int r = dy / 2; if (r > 2) r = 2;
+            for (int dx = -r; dx <= r; dx++)
+                for (int dz = -r; dz <= r; dz++) {
+                    if (dx == 0 && dz == 0) continue;
+                    if (abs(dx) == r && abs(dz) == r) continue;   /* clip corners */
+                    if (get_block(x + dx, level, z + dz) == B_AIR)
+                        set_block(x + dx, level, z + dz, leafb);
+                }
+        }
+        set_block(x, top + 1, z, leafb);       /* tip */
+    } else {
+        for (int dy = -1; dy <= 2; dy++) {
+            int r = (dy <= 0) ? 2 : 1;
+            for (int dx = -r; dx <= r; dx++)
+                for (int dz = -r; dz <= r; dz++) {
+                    if (dx == 0 && dz == 0 && dy <= 0) continue;
+                    if (abs(dx) == r && abs(dz) == r && (rnd2(x + dx, z + dz) < 0.4f)) continue;
+                    int yy = top + dy;
+                    if (get_block(x + dx, yy, z + dz) == B_AIR)
+                        set_block(x + dx, yy, z + dz, leafb);
+                }
+        }
     }
 }
 
-/* terrain height at world column (x,z), deterministic from the seed */
+static void place_cactus(int x, int z, int ground) {
+    int h = 1 + (int)(rnd2(x * 3, z * 5) * 3.0f);
+    for (int i = 1; i <= h; i++) set_block(x, ground + i, z, B_CACTUS);
+}
+
+/* terrain height at world column (x,z), deterministic from the seed.
+   A low-frequency "continentalness" term dominates so oceans, coastlines and
+   mountains form coherent regions, with a higher-frequency term adding local
+   hills. This keeps biome classification (which reads this height) coherent. */
 static int column_height(int x, int z) {
     float ox = (g_seed % 997) * 1.3f, oz = (g_seed % 733) * 1.7f;
-    float n = fbm((x + ox) * 0.045f, (z + oz) * 0.045f);
-    int h = (int)(14 + n * 30);
+    float cont   = fbm((x + ox) * 0.0055f, (z + oz) * 0.0055f);   /* continents */
+    float detail = fbm((x + ox) * 0.045f,  (z + oz) * 0.045f);    /* local hills */
+    float n = cont * 0.78f + detail * 0.22f;
+    int h = (int)(8 + n * 42);
     if (h < 1) h = 1;
     if (h >= WORLD_Y) h = WORLD_Y - 1;
     return h;
+}
+
+/* ---- biomes (Minecraft-style set) ---- */
+enum {
+    BIO_OCEAN, BIO_FROZEN_OCEAN, BIO_BEACH, BIO_PLAINS, BIO_FOREST, BIO_BIRCH,
+    BIO_DARK_FOREST, BIO_JUNGLE, BIO_SAVANNA, BIO_DESERT, BIO_BADLANDS,
+    BIO_SWAMP, BIO_TAIGA, BIO_SNOWY, BIO_MOUNTAINS, BIO_MUSHROOM, BIO_COUNT
+};
+
+/* temperature + humidity fields (large, slow-varying regions) */
+static void climate(int x, int z, float *t, float *hu) {
+    float ox = (g_seed % 521) * 2.1f, oz = (g_seed % 389) * 1.7f;
+    *t  = fbm((x + ox) * 0.0016f, (z + oz) * 0.0016f);
+    *hu = fbm((x + ox + 4096) * 0.0016f, (z + oz + 4096) * 0.0016f);
+}
+
+/* Pick the biome for a world column from elevation + climate. */
+static int biome_at(int x, int z) {
+    int h0 = column_height(x, z);
+    float t, hu; climate(x, z, &t, &hu);
+    if (h0 <= WATER_LEVEL - 4) return (t < 0.28f) ? BIO_FROZEN_OCEAN : BIO_OCEAN;
+    if (h0 <= WATER_LEVEL + 1) return BIO_BEACH;
+    if (h0 > WATER_LEVEL + 24) return BIO_MOUNTAINS;
+    if (fbm((x + 900) * 0.03f, (z - 900) * 0.03f) > 0.86f) return BIO_MUSHROOM;
+    if (t < 0.25f) return (hu < 0.5f) ? BIO_SNOWY : BIO_TAIGA;
+    if (t < 0.5f) {
+        if (hu > 0.75f) return BIO_DARK_FOREST;
+        if (hu > 0.52f) return BIO_FOREST;
+        if (hu > 0.34f) return BIO_BIRCH;
+        return BIO_PLAINS;
+    }
+    if (t < 0.72f) {
+        if (hu > 0.72f) return BIO_JUNGLE;
+        if (hu > 0.56f) return BIO_SWAMP;
+        if (hu > 0.30f) return BIO_PLAINS;
+        return BIO_SAVANNA;
+    }
+    if (hu > 0.62f) return BIO_JUNGLE;
+    if (hu > 0.38f) return BIO_SAVANNA;
+    if (hu > 0.20f) return BIO_DESERT;
+    return BIO_BADLANDS;
+}
+
+/* Height after biome shaping (mountains rise, swamps flatten near water). */
+static int surface_height(int x, int z) {
+    int h = column_height(x, z);
+    int b = biome_at(x, z);
+    if (b == BIO_MOUNTAINS) { int over = h - (WATER_LEVEL + 24); if (over < 0) over = 0; h += (int)(over * 1.6f); }
+    else if (b == BIO_SWAMP) { if (h > WATER_LEVEL + 2) h = WATER_LEVEL + 1 + (h - (WATER_LEVEL + 2)) / 3; }
+    else if (b == BIO_DESERT || b == BIO_SAVANNA) { int m = WATER_LEVEL + 6; h = m + (h - m) * 3 / 4; }
+    if (h < 1) h = 1;
+    if (h >= WORLD_Y) h = WORLD_Y - 1;
+    return h;
+}
+
+/* Top and sub-surface (filler) block for a biome column of height h. */
+static void biome_surface(int b, int h, uint8_t *top, uint8_t *filler) {
+    switch (b) {
+        case BIO_OCEAN: case BIO_FROZEN_OCEAN: *top = B_SAND; *filler = B_DIRT; break;
+        case BIO_BEACH:   *top = B_SAND; *filler = B_SAND; break;
+        case BIO_DESERT:  *top = B_SAND; *filler = B_SAND; break;
+        case BIO_BADLANDS:*top = B_RED_SAND; *filler = B_TERRACOTTA; break;
+        case BIO_SNOWY:   *top = B_SNOW; *filler = B_DIRT; break;
+        case BIO_SAVANNA: *top = B_DRY_GRASS; *filler = B_DIRT; break;
+        case BIO_MUSHROOM:*top = B_MYCELIUM; *filler = B_DIRT; break;
+        case BIO_MOUNTAINS:
+            *top = (h > WATER_LEVEL + 34) ? B_SNOW : (h > WATER_LEVEL + 30) ? B_STONE : B_GRASS;
+            *filler = (*top == B_GRASS) ? B_DIRT : B_STONE; break;
+        default:          *top = B_GRASS; *filler = B_DIRT; break;   /* plains/forest/... */
+    }
 }
 
 /* Generate chunk (cx,cz) into ring cell c. */
@@ -256,24 +357,47 @@ static void gen_chunk(Chunk *c, int cx, int cz) {
     for (int lx = 0; lx < CH; lx++)
         for (int lz = 0; lz < CH; lz++) {
             int wx = cx * CH + lx, wz = cz * CH + lz;
-            int h = column_height(wx, wz);
+            int b = biome_at(wx, wz);
+            int h = surface_height(wx, wz);
+            uint8_t top, filler; biome_surface(b, h, &top, &filler);
             for (int y = 0; y <= h; y++) {
-                uint8_t b;
-                if (y == h)          b = (h <= WATER_LEVEL + 1) ? B_SAND : B_GRASS;
-                else if (y >= h - 3) b = (h <= WATER_LEVEL + 1) ? B_SAND : B_DIRT;
-                else                 b = B_STONE;
-                c->b[(y * CH + lz) * CH + lx] = b;
+                uint8_t bl;
+                if (y == h)          bl = top;
+                else if (y >= h - 3) bl = filler;
+                else                 bl = B_STONE;
+                c->b[(y * CH + lz) * CH + lx] = bl;
             }
+            /* water (frozen oceans get an ice sheet on top) */
             for (int y = h + 1; y <= WATER_LEVEL; y++)
                 c->b[(y * CH + lz) * CH + lx] = B_WATER;
+            if (b == BIO_FROZEN_OCEAN && h < WATER_LEVEL)
+                c->b[(WATER_LEVEL * CH + lz) * CH + lx] = B_ICE;
         }
-    /* trees, kept in the chunk interior so canopies never cross a border */
+    /* vegetation, kept in the chunk interior so canopies never cross a border */
     for (int lx = 2; lx < CH - 2; lx++)
         for (int lz = 2; lz < CH - 2; lz++) {
             int wx = cx * CH + lx, wz = cz * CH + lz;
-            int h = column_height(wx, wz);
-            if (h > WATER_LEVEL + 1 && rnd2(wx * 13 + 1, wz * 17 + 5) < 0.018f)
-                place_tree(wx, wz, h);
+            int b = biome_at(wx, wz);
+            int h = surface_height(wx, wz);
+            if (h <= WATER_LEVEL) continue;
+            float r = rnd2(wx * 13 + 1, wz * 17 + 5);
+            switch (b) {
+                case BIO_FOREST:      if (r < 0.060f) place_tree_type(wx, wz, h, B_LOG, B_LEAVES, 4, 3, 0); break;
+                case BIO_BIRCH:       if (r < 0.050f) place_tree_type(wx, wz, h, B_BIRCH_LOG, B_LEAVES, 5, 3, 0); break;
+                case BIO_DARK_FOREST: if (r < 0.100f) place_tree_type(wx, wz, h, B_LOG, B_LEAVES, 5, 2, 0); break;
+                case BIO_PLAINS:      if (r < 0.008f) place_tree_type(wx, wz, h, B_LOG, B_LEAVES, 4, 3, 0); break;
+                case BIO_JUNGLE:      if (r < 0.070f) place_tree_type(wx, wz, h, B_LOG, B_JUNGLE_LEAVES, 8, 6, 0); break;
+                case BIO_SAVANNA:     if (r < 0.012f) place_tree_type(wx, wz, h, B_LOG, B_LEAVES, 4, 2, 0); break;
+                case BIO_TAIGA:       if (r < 0.050f) place_tree_type(wx, wz, h, B_LOG, B_SPRUCE_LEAVES, 6, 4, 1); break;
+                case BIO_SNOWY:       if (r < 0.020f) place_tree_type(wx, wz, h, B_LOG, B_SPRUCE_LEAVES, 6, 3, 1); break;
+                case BIO_SWAMP:       if (r < 0.015f) place_tree_type(wx, wz, h, B_LOG, B_LEAVES, 5, 2, 0); break;
+                case BIO_MOUNTAINS:
+                    if (get_block(wx, h, wz) == B_GRASS && r < 0.010f)
+                        place_tree_type(wx, wz, h, B_LOG, B_SPRUCE_LEAVES, 5, 3, 1);
+                    break;
+                case BIO_DESERT:      if (r < 0.010f) place_cactus(wx, wz, h); break;
+                default: break;   /* ocean/beach/badlands/mushroom: no trees */
+            }
         }
 }
 
@@ -388,6 +512,36 @@ static void gen_textures(void) {
                 g_tex[B_GLASS][f][y * TEX + x] = edge ? rgb(200, 220, 230) : rgb(170, 200, 215);
             }
     }
+
+    /* ---- biome blocks (uniform across faces) ---- */
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_SNOW][f], 236, 240, 246, 8, 11);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_ICE][f], 150, 190, 230, 10, 12);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_RED_SAND][f], 200, 110, 60, 16, 13);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_TERRACOTTA][f], 156, 92, 58, 14, 14);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_DRY_GRASS][f], 150, 160, 72, 20, 15);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_PODZOL][f], 92, 66, 40, 16, 16);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_SPRUCE_LEAVES][f], 40, 72, 46, 22, 17);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_JUNGLE_LEAVES][f], 46, 122, 40, 24, 18);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_CACTUS][f], 60, 120, 52, 14, 19);
+
+    /* mycelium: grey soil with purple flecks */
+    for (int f = 0; f < 3; f++) {
+        fill_tex(g_tex[B_MYCELIUM][f], 122, 110, 124, 14, 20);
+        for (int y = 0; y < TEX; y++)
+            for (int x = 0; x < TEX; x++)
+                if (rnd2(x * 5 + f, y * 7) < 0.10f) g_tex[B_MYCELIUM][f][y * TEX + x] = rgb(120, 80, 130);
+    }
+    /* birch log: pale bark with dark dashes; rings on the ends */
+    fill_tex(g_tex[B_BIRCH_LOG][1], 220, 222, 210, 10, 21);
+    for (int y = 0; y < TEX; y++)
+        for (int x = 0; x < TEX; x++)
+            if (((y % 5) == 0) && rnd2(x, y) < 0.5f) g_tex[B_BIRCH_LOG][1][y * TEX + x] = rgb(40, 40, 40);
+    for (int f = 0; f < 3; f += 2)
+        for (int y = 0; y < TEX; y++)
+            for (int x = 0; x < TEX; x++) {
+                float dx = x - 7.5f, dy = y - 7.5f; int ring = ((int)sqrtf(dx * dx + dy * dy) % 2) ? 18 : 0;
+                g_tex[B_BIRCH_LOG][f][y * TEX + x] = rgb(210 - ring, 212 - ring, 198 - ring);
+            }
 }
 
 /* ----------------------------------------------------------------------- */
