@@ -65,6 +65,8 @@ enum {
     /* biome blocks */
     B_SNOW, B_ICE, B_RED_SAND, B_TERRACOTTA, B_DRY_GRASS, B_PODZOL,
     B_MYCELIUM, B_SPRUCE_LEAVES, B_JUNGLE_LEAVES, B_BIRCH_LOG, B_CACTUS,
+    /* decorations */
+    B_PUMPKIN, B_FLOWER, B_TALLGRASS, B_DEADBUSH, B_LILYPAD,
     B_COUNT
 };
 
@@ -287,11 +289,16 @@ enum {
     BIO_SWAMP, BIO_TAIGA, BIO_SNOWY, BIO_MOUNTAINS, BIO_MUSHROOM, BIO_COUNT
 };
 
-/* temperature + humidity fields (large, slow-varying regions) */
+/* temperature + humidity fields (large, slow-varying regions). The sample
+   point is domain-warped by a second noise so biome borders wiggle organically
+   instead of following smooth noise contours. */
 static void climate(int x, int z, float *t, float *hu) {
     float ox = (g_seed % 521) * 2.1f, oz = (g_seed % 389) * 1.7f;
-    *t  = fbm((x + ox) * 0.0016f, (z + oz) * 0.0016f);
-    *hu = fbm((x + ox + 4096) * 0.0016f, (z + oz + 4096) * 0.0016f);
+    float wx = (fbm((x + ox + 71) * 0.012f, (z + oz + 71) * 0.012f) - 0.5f) * 44.0f;
+    float wz = (fbm((x + ox + 233) * 0.012f, (z + oz + 233) * 0.012f) - 0.5f) * 44.0f;
+    float fx = x + wx, fz = z + wz;
+    *t  = fbm((fx + ox) * 0.0016f, (fz + oz) * 0.0016f);
+    *hu = fbm((fx + ox + 4096) * 0.0016f, (fz + oz + 4096) * 0.0016f);
 }
 
 /* Pick the biome for a world column from elevation + climate. */
@@ -372,6 +379,9 @@ static void gen_chunk(Chunk *c, int cx, int cz) {
                 c->b[(y * CH + lz) * CH + lx] = B_WATER;
             if (b == BIO_FROZEN_OCEAN && h < WATER_LEVEL)
                 c->b[(WATER_LEVEL * CH + lz) * CH + lx] = B_ICE;
+            /* swamp lily pads floating on the water surface */
+            if (b == BIO_SWAMP && h < WATER_LEVEL && rnd2(wx * 5 + 2, wz * 9 + 4) < 0.10f)
+                c->b[(WATER_LEVEL * CH + lz) * CH + lx] = B_LILYPAD;
         }
     /* vegetation, kept in the chunk interior so canopies never cross a border */
     for (int lx = 2; lx < CH - 2; lx++)
@@ -398,6 +408,50 @@ static void gen_chunk(Chunk *c, int cx, int cz) {
                 case BIO_DESERT:      if (r < 0.010f) place_cactus(wx, wz, h); break;
                 default: break;   /* ocean/beach/badlands/mushroom: no trees */
             }
+
+            /* ground decorations (only where nothing was placed above) */
+            if (get_block(wx, h + 1, wz) != B_AIR || get_block(wx, h, wz) == B_SAND ||
+                get_block(wx, h, wz) == B_WATER)
+                { /* skip: occupied, or on sand/water */ }
+            else {
+                float rd = rnd2(wx * 31 + 7, wz * 29 + 3);
+                uint8_t deco = B_AIR;
+                switch (b) {
+                    case BIO_PLAINS:
+                        if (rd < 0.004f) deco = B_PUMPKIN;
+                        else if (rd < 0.05f) deco = B_FLOWER;
+                        else if (rd < 0.18f) deco = B_TALLGRASS;
+                        break;
+                    case BIO_FOREST: case BIO_BIRCH: case BIO_DARK_FOREST:
+                        if (rd < 0.04f) deco = B_FLOWER;
+                        else if (rd < 0.16f) deco = B_TALLGRASS;
+                        break;
+                    case BIO_SAVANNA:
+                        if (rd < 0.006f) deco = B_DEADBUSH;
+                        else if (rd < 0.22f) deco = B_TALLGRASS;
+                        break;
+                    case BIO_JUNGLE:
+                        if (rd < 0.28f) deco = B_TALLGRASS;
+                        break;
+                    case BIO_SWAMP:
+                        if (rd < 0.12f) deco = B_TALLGRASS;
+                        break;
+                    default: break;
+                }
+                if (deco != B_AIR) set_block(wx, h + 1, wz, deco);
+            }
+            /* boulders (cobblestone) in forests and taiga */
+            if ((b == BIO_FOREST || b == BIO_DARK_FOREST || b == BIO_TAIGA) &&
+                get_block(wx, h + 1, wz) == B_AIR &&
+                rnd2(wx * 17 + 5, wz * 13 + 9) < 0.004f) {
+                for (int dx = 0; dx <= 1; dx++)
+                    for (int dz = 0; dz <= 1; dz++)
+                        set_block(wx + dx, h + 1, wz + dz, B_COBBLE);
+            }
+            /* dead bushes on desert/badlands sand */
+            if ((b == BIO_DESERT || b == BIO_BADLANDS) && get_block(wx, h + 1, wz) == B_AIR &&
+                rnd2(wx * 23 + 1, wz * 19 + 6) < 0.02f)
+                set_block(wx, h + 1, wz, B_DEADBUSH);
         }
 }
 
@@ -530,6 +584,24 @@ static void gen_textures(void) {
         for (int y = 0; y < TEX; y++)
             for (int x = 0; x < TEX; x++)
                 if (rnd2(x * 5 + f, y * 7) < 0.10f) g_tex[B_MYCELIUM][f][y * TEX + x] = rgb(120, 80, 130);
+    }
+    /* ---- decorations ---- */
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_TALLGRASS][f], 96, 150, 66, 26, 22);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_DEADBUSH][f], 130, 96, 52, 20, 23);
+    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_LILYPAD][f], 54, 110, 58, 18, 24);
+    /* pumpkin: orange with darker ridges, a face-ish front on the side */
+    for (int f = 0; f < 3; f++) {
+        fill_tex(g_tex[B_PUMPKIN][f], 214, 128, 34, 14, 25);
+        for (int x = 0; x < TEX; x++)
+            if ((x % 4) == 0)
+                for (int y = 0; y < TEX; y++) g_tex[B_PUMPKIN][f][y * TEX + x] = rgb(170, 96, 24);
+    }
+    /* flower: green base with a red/yellow bloom in the middle */
+    for (int f = 0; f < 3; f++) {
+        fill_tex(g_tex[B_FLOWER][f], 96, 150, 66, 22, 26);
+        for (int y = 3; y < 8; y++)
+            for (int x = 6; x < 11; x++)
+                g_tex[B_FLOWER][f][y * TEX + x] = ((x + y) & 1) ? rgb(220, 60, 60) : rgb(240, 220, 60);
     }
     /* birch log: pale bark with dark dashes; rings on the ends */
     fill_tex(g_tex[B_BIRCH_LOG][1], 220, 222, 210, 10, 21);
