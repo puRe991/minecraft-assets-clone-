@@ -62,7 +62,7 @@ The same sources cross-compile for Windows with `x86_64-w64-mingw32-g++` and
 | 8 | Creatures: entities, AI states, A* pathfinding, spawning rules | ✅ done, tested |
 | 9 | Audio system (footsteps, digging, ambience/weather, music scheduler) | ✅ done, tested |
 | 10 | Persistence: chunk save/load, RLE compression, autosave | ✅ done, tested |
-| — | App module: window + software rasterizer that assembles all the above | ⏳ next |
+| — | App: Win32 window + software raycast renderer wiring it all into a `.exe` | ✅ built (win32/win64) |
 
 Each row is delivered only after its unit tests pass.
 
@@ -264,8 +264,31 @@ win32/win64.
 
 ---
 
-**Core engine status: 10/10 modules complete**, 83 unit-test cases, all green,
-every module cross-compiling for Windows 32- and 64-bit. What remains is the
-**app module**: the Win32 window, input loop, and software rasterizer that wire
-these systems together into a runnable `.exe`. (The MiniCraft prototype in the
-repo root is already a complete, playable Windows build in this style.)
+## App — the runnable game (`dist/VoxelGame-win{32,64}.exe`)
+
+`app/main.cpp` assembles the engine into a playable Windows program, and
+`app/build.sh` cross-compiles it for both architectures. It is self-contained
+(statically linked; imports only `KERNEL32/USER32/GDI32/msvcrt`).
+
+- **`app/Renderer.hpp`** — a platform-independent software **raycaster** that
+  draws the `World` into an ARGB framebuffer with face shading, a day/night sky
+  and distance fog. The same function backs the Win32 window and the headless
+  `app/screenshot.cpp` (which renders the world to PNG — see `app_*.png`).
+- **`app/main.cpp`** — Win32 window + mouse-look/WASD input → the physics
+  `PlayerController`, `World.updateStreaming` around the player, block break/
+  place via a raycast, a day/night cycle, and `WorldSaver` + `AutoSaver`
+  persistence. Controls: mouse look, WASD, Space jump, Shift crouch, Ctrl
+  sprint, left/right click break/place, 1–9 select block, Esc quit.
+
+Build it:
+
+```sh
+cd voxelgame && ./app/build.sh      # -> dist/VoxelGame-win32.exe / -win64.exe
+```
+
+---
+
+**Status: 10/10 engine modules + a runnable app.** 83 unit-test cases, all
+green; every module and the `.exe` cross-compile for Windows 32- and 64-bit.
+The renderer here is a raycaster (dependency-free, actually runs); the tested
+greedy `Mesher` + `LightEngine` are the foundation for a future GPU path.

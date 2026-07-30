@@ -2,3 +2,5 @@ build/
 *.o
 run_tests
 render_*.png
+app_*.png
+voxel_save/
