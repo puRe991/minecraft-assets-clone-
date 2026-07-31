@@ -5,6 +5,12 @@
  * copyrighted assets). All block textures are generated procedurally at
  * runtime. Rendering is a software voxel raycaster (Amanatides & Woo DDA).
  *
+ * The raycaster is the whole cost of a frame, so it gets three things:
+ * rays are clipped to the world box, empty space is skipped a macro cell at a
+ * time via a coarse occupancy grid, and scanlines are split across a pool of
+ * worker threads. If a machine still cannot keep up, the internal resolution
+ * drops automatically and the result is upscaled to the window.
+ *
  * Controls:
  *   Mouse            look around
  *   W / A / S / D    move
@@ -16,6 +22,8 @@
  *   1..9, 0          select block to place
  *   K / L            save / load the world (world.sav)
  *   R                regenerate the world
+ *   T                toggle adaptive resolution
+ *   + / -            raise / lower render resolution (locks it)
  *   Esc              quit
  *
  * Build: see build.sh (cross-compiled with MinGW-w64 for i686 and x86_64).
@@ -54,6 +62,17 @@
 
 #define TEX 16                /* texture size (px)                          */
 
+/* Side of a macro cell in the coarse occupancy grid used to skip empty space
+   while raycasting. Must divide all three world dimensions. */
+#define MACRO 8
+#define MACRO_X (WORLD_X / MACRO)
+#define MACRO_Y (WORLD_Y / MACRO)
+#define MACRO_Z (WORLD_Z / MACRO)
+typedef char macro_divides_world[(WORLD_X % MACRO == 0 && WORLD_Y % MACRO == 0 &&
+                                  WORLD_Z % MACRO == 0) ? 1 : -1];
+
+#define MAX_THREADS 16        /* upper bound on render worker threads        */
+
 /* Block ids */
 enum {
     B_AIR = 0, B_GRASS, B_DIRT, B_STONE, B_COBBLE,
@@ -66,7 +85,19 @@ enum {
 /* ----------------------------------------------------------------------- */
 
 static uint8_t  g_world[WORLD_X * WORLD_Y * WORLD_Z];
+
+/* Coarse occupancy grid: g_macro[c] is nonzero when macro cell c contains at
+   least one ray-stopping block. A zero cell is guaranteed empty, which lets
+   the raycaster jump MACRO blocks at a time through open air and sky. */
+static uint8_t  g_macro[MACRO_X * MACRO_Y * MACRO_Z];
+static int      g_macro_defer = 0;   /* bulk world edit in progress          */
+
 static uint32_t g_framebuf[RENDER_W * RENDER_H];
+
+/* Current internal render size. Never exceeds RENDER_W/RENDER_H; the adaptive
+   resolution controller lowers it when frames get expensive. Rows are packed
+   at stride g_rw. */
+static int g_rw = RENDER_W, g_rh = RENDER_H;
 static uint32_t g_tex[B_COUNT][3][TEX * TEX];   /* [block][face 0=top,1=side,2=bottom] */
 
 static float g_px = WORLD_X * 0.5f, g_py = 40.0f, g_pz = WORLD_Z * 0.5f;
@@ -100,12 +131,38 @@ static inline uint8_t get_block(int x, int y, int z) {
     if (!in_world(x, y, z)) return B_AIR;
     return g_world[(y * WORLD_Z + z) * WORLD_X + x];
 }
-static inline void set_block(int x, int y, int z, uint8_t v) {
-    if (in_world(x, y, z)) g_world[(y * WORLD_Z + z) * WORLD_X + x] = v;
-}
-static inline int is_solid(int x, int y, int z) {
-    uint8_t b = get_block(x, y, z);
+static inline int stops_ray(uint8_t b) {
     return b != B_AIR && b != B_WATER;   /* water is passable */
+}
+
+/* Recompute one macro cell from the blocks it covers. */
+static void macro_rebuild_cell(int mx, int my, int mz) {
+    int occupied = 0;
+    for (int y = my * MACRO; y < my * MACRO + MACRO && !occupied; y++)
+        for (int z = mz * MACRO; z < mz * MACRO + MACRO && !occupied; z++)
+            for (int x = mx * MACRO; x < mx * MACRO + MACRO; x++)
+                if (stops_ray(g_world[(y * WORLD_Z + z) * WORLD_X + x])) { occupied = 1; break; }
+    g_macro[(my * MACRO_Z + mz) * MACRO_X + mx] = (uint8_t)occupied;
+}
+
+static void macro_rebuild_all(void) {
+    for (int my = 0; my < MACRO_Y; my++)
+        for (int mz = 0; mz < MACRO_Z; mz++)
+            for (int mx = 0; mx < MACRO_X; mx++)
+                macro_rebuild_cell(mx, my, mz);
+}
+
+static inline void set_block(int x, int y, int z, uint8_t v) {
+    if (!in_world(x, y, z)) return;
+    g_world[(y * WORLD_Z + z) * WORLD_X + x] = v;
+    if (g_macro_defer) return;                 /* caller rebuilds afterwards */
+    int m = ((y / MACRO) * MACRO_Z + (z / MACRO)) * MACRO_X + (x / MACRO);
+    if (stops_ray(v)) g_macro[m] = 1;          /* marking is always safe     */
+    else if (g_macro[m]) macro_rebuild_cell(x / MACRO, y / MACRO, z / MACRO);
+}
+
+static inline int is_solid(int x, int y, int z) {
+    return stops_ray(get_block(x, y, z));
 }
 
 /* ----------------------------------------------------------------------- */
@@ -164,6 +221,7 @@ static void place_tree(int x, int z, int ground) {
 
 static void gen_world(unsigned seed) {
     for (unsigned i = 0; i < sizeof(g_world); i++) g_world[i] = B_AIR;
+    g_macro_defer = 1;                 /* one rebuild at the end, not 1M */
     float ox = (seed % 997) * 1.3f, oz = (seed % 733) * 1.7f;
 
     for (int x = 0; x < WORLD_X; x++) {
@@ -198,6 +256,9 @@ static void gen_world(unsigned seed) {
                 rnd2(x * 13 + 1, z * 17 + 5) < 0.018f)
                 place_tree(x, z, y);
         }
+
+    g_macro_defer = 0;
+    macro_rebuild_all();
 
     /* spawn on top of terrain at center */
     int cx = WORLD_X / 2, cz = WORLD_Z / 2, cy = WORLD_Y - 1;
@@ -424,6 +485,8 @@ static int load_world(const char *path) {
         while (run-- && i < total) g_world[i++] = (uint8_t)v;
     }
     fclose(f);
+    macro_rebuild_all();            /* g_world was written directly, even on a
+                                       short read, so resync the macro grid */
     if (i != total) return 0;
     g_px = ps[0]; g_py = ps[1]; g_pz = ps[2]; g_yaw = ps[3]; g_pitch = ps[4];
     g_vx = g_vy = g_vz = 0; g_onground = 0;
@@ -448,141 +511,384 @@ static void camera_basis(V3 *fwd, V3 *right, V3 *up) {
     up->z = right->x * fwd->y - right->y * fwd->x;
 }
 
-/* DDA raycast. Returns 1 on hit. Fills block coords, face normal, and the
-   coord of the empty cell just before the hit (for placement). */
+/* DDA raycast (Amanatides & Woo). Returns 1 on hit, filling the block coords,
+   the face normal, the distance and the block id.
+ *
+ * Three things keep this cheap, since it runs once per pixel:
+ *   1. the ray is clipped to the world box up front, so a ray aimed at the sky
+ *      stops at the world boundary instead of stepping all the way to maxdist;
+ *   2. traversal is hierarchical -- an outer DDA walks the macro grid and skips
+ *      MACRO blocks at a stride whenever a macro cell is known to be empty;
+ *   3. the inner DDA is confined to one macro cell, so its block reads are
+ *      in-bounds by construction and need no per-step bounds check.
+ * The visible result is identical to a plain per-block DDA. */
 static int raycast(float ox, float oy, float oz, float dx, float dy, float dz,
                    float maxdist, int *hx, int *hy, int *hz,
                    int *nx, int *ny, int *nz, float *outdist, int *outblock) {
-    int mapx = (int)floorf(ox), mapy = (int)floorf(oy), mapz = (int)floorf(oz);
-    float ddx = (dx == 0) ? 1e30f : fabsf(1.0f / dx);
-    float ddy = (dy == 0) ? 1e30f : fabsf(1.0f / dy);
-    float ddz = (dz == 0) ? 1e30f : fabsf(1.0f / dz);
+    /* signed inverses (0 stands in for "never crosses"; guarded by the ddN
+       sentinel below) and the classic per-axis DDA constants */
+    float ix = (dx == 0.0f) ? 0.0f : 1.0f / dx;
+    float iy = (dy == 0.0f) ? 0.0f : 1.0f / dy;
+    float iz = (dz == 0.0f) ? 0.0f : 1.0f / dz;
+    float ddx = (dx == 0.0f) ? 1e30f : fabsf(ix);
+    float ddy = (dy == 0.0f) ? 1e30f : fabsf(iy);
+    float ddz = (dz == 0.0f) ? 1e30f : fabsf(iz);
     int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1, sz = dz < 0 ? -1 : 1;
-    float sdx = (dx < 0 ? (ox - mapx) : (mapx + 1 - ox)) * ddx;
-    float sdy = (dy < 0 ? (oy - mapy) : (mapy + 1 - oy)) * ddy;
-    float sdz = (dz < 0 ? (oz - mapz) : (mapz + 1 - oz)) * ddz;
-    int side = 0;
-    float dist = 0;
 
-    for (int iter = 0; iter < 1024; iter++) {
-        if (sdx < sdy && sdx < sdz) { dist = sdx; sdx += ddx; mapx += sx; side = 0; }
-        else if (sdy < sdz)         { dist = sdy; sdy += ddy; mapy += sy; side = 1; }
-        else                        { dist = sdz; sdz += ddz; mapz += sz; side = 2; }
-        if (dist > maxdist) return 0;
-        uint8_t b = get_block(mapx, mapy, mapz);
-        if (b != B_AIR && b != B_WATER) {
-            *hx = mapx; *hy = mapy; *hz = mapz;
-            *nx = *ny = *nz = 0;
-            if (side == 0)      *nx = -sx;
-            else if (side == 1) *ny = -sy;
-            else                *nz = -sz;
-            if (outdist) *outdist = dist;
-            if (outblock) *outblock = b;
-            return 1;
+    /* --- clip the ray to the world box --- */
+    float t0 = 0.0f, t1 = maxdist, ta, tb;
+    int entry_axis = -1;              /* face the ray enters the box by, if any */
+    int inside = (ox >= 0.0f && ox < (float)WORLD_X && oy >= 0.0f && oy < (float)WORLD_Y &&
+                  oz >= 0.0f && oz < (float)WORLD_Z);
+    if (inside) {
+        /* Fast path -- the camera is in the world, so only the exit matters.
+           This is the case for every one of the ~130k rays cast per frame. */
+        if (dx != 0.0f) { ta = ((dx > 0 ? (float)WORLD_X : 0.0f) - ox) * ix; if (ta < t1) t1 = ta; }
+        if (dy != 0.0f) { ta = ((dy > 0 ? (float)WORLD_Y : 0.0f) - oy) * iy; if (ta < t1) t1 = ta; }
+        if (dz != 0.0f) { ta = ((dz > 0 ? (float)WORLD_Z : 0.0f) - oz) * iz; if (ta < t1) t1 = ta; }
+    } else {
+        if (dx == 0.0f) { if (ox < 0.0f || ox >= (float)WORLD_X) return 0; }
+        else { ta = (0.0f - ox) * ix; tb = ((float)WORLD_X - ox) * ix;
+               if (ta > tb) { float s = ta; ta = tb; tb = s; }
+               if (ta > t0) { t0 = ta; entry_axis = 0; }
+               if (tb < t1) t1 = tb;
+               if (t0 > t1) return 0; }
+        if (dy == 0.0f) { if (oy < 0.0f || oy >= (float)WORLD_Y) return 0; }
+        else { ta = (0.0f - oy) * iy; tb = ((float)WORLD_Y - oy) * iy;
+               if (ta > tb) { float s = ta; ta = tb; tb = s; }
+               if (ta > t0) { t0 = ta; entry_axis = 1; }
+               if (tb < t1) t1 = tb;
+               if (t0 > t1) return 0; }
+        if (dz == 0.0f) { if (oz < 0.0f || oz >= (float)WORLD_Z) return 0; }
+        else { ta = (0.0f - oz) * iz; tb = ((float)WORLD_Z - oz) * iz;
+               if (ta > tb) { float s = ta; ta = tb; tb = s; }
+               if (ta > t0) { t0 = ta; entry_axis = 2; }
+               if (tb < t1) t1 = tb;
+               if (t0 > t1) return 0; }
+    }
+    if (t1 <= 0.0f) return 0;
+
+    int mx, my, mz;               /* current block cell                       */
+    float sdx, sdy, sdz;          /* absolute t of the next crossing per axis  */
+    float t = t0;                 /* t at which the current cell was entered   */
+
+    /* (Re)start the block DDA from the point at parameter t. Used once at the
+       world entry point and again after every jump over empty space.
+       The clamp makes a truncating cast equivalent to floorf() here, which
+       matters because floorf() is an out-of-line call on the 32-bit target. */
+#define SEED_DDA() do {                                                        \
+        float px = ox + dx * t, py = oy + dy * t, pz = oz + dz * t;            \
+        mx = (int)px; if (mx < 0) mx = 0;                                      \
+        else if (mx >= WORLD_X) mx = WORLD_X - 1;                              \
+        my = (int)py; if (my < 0) my = 0;                                      \
+        else if (my >= WORLD_Y) my = WORLD_Y - 1;                              \
+        mz = (int)pz; if (mz < 0) mz = 0;                                      \
+        else if (mz >= WORLD_Z) mz = WORLD_Z - 1;                              \
+        sdx = (dx < 0 ? (px - mx) : (mx + 1 - px)) * ddx + t;                  \
+        sdy = (dy < 0 ? (py - my) : (my + 1 - py)) * ddy + t;                  \
+        sdz = (dz < 0 ? (pz - mz) : (mz + 1 - pz)) * ddz + t;                  \
+    } while (0)
+
+    SEED_DDA();
+
+    /* A cell is entered through the face named by `side`; -1 marks the cell the
+       ray starts in, which stays untested so a camera stuck inside a block can
+       still see out (the original behaviour). */
+    int side = entry_axis;
+    int check_macro = 1;
+
+    /* index of the first block of a macro cell along each axis, in the
+       direction of travel -- reaching it means a new macro cell was entered */
+    const int edge_x = (sx > 0) ? 0 : MACRO - 1;
+    const int edge_y = (sy > 0) ? 0 : MACRO - 1;
+    const int edge_z = (sz > 0) ? 0 : MACRO - 1;
+
+    for (;;) {
+        /* --- 1. jump over runs of empty macro cells --- */
+        if (check_macro &&
+            !g_macro[((my / MACRO) * MACRO_Z + (mz / MACRO)) * MACRO_X + (mx / MACRO)]) {
+            int mcx = mx / MACRO, mcy = my / MACRO, mcz = mz / MACRO;
+            float tmx = (dx == 0.0f) ? 1e30f : ((float)((dx > 0 ? mcx + 1 : mcx) * MACRO) - ox) * ix;
+            float tmy = (dy == 0.0f) ? 1e30f : ((float)((dy > 0 ? mcy + 1 : mcy) * MACRO) - oy) * iy;
+            float tmz = (dz == 0.0f) ? 1e30f : ((float)((dz > 0 ? mcz + 1 : mcz) * MACRO) - oz) * iz;
+            do {
+                if (tmx < tmy && tmx < tmz) {
+                    t = tmx; if (t >= t1) return 0;
+                    mcx += sx; if ((unsigned)mcx >= MACRO_X) return 0;
+                    tmx += MACRO * ddx; side = 0;
+                } else if (tmy < tmz) {
+                    t = tmy; if (t >= t1) return 0;
+                    mcy += sy; if ((unsigned)mcy >= MACRO_Y) return 0;
+                    tmy += MACRO * ddy; side = 1;
+                } else {
+                    t = tmz; if (t >= t1) return 0;
+                    mcz += sz; if ((unsigned)mcz >= MACRO_Z) return 0;
+                    tmz += MACRO * ddz; side = 2;
+                }
+            } while (!g_macro[(mcy * MACRO_Z + mcz) * MACRO_X + mcx]);
+            SEED_DDA();      /* land on the first block of the occupied cell */
+        }
+        check_macro = 0;
+
+        /* --- 2. test the cell we are in --- */
+        if (side >= 0) {
+            uint8_t blk = g_world[(my * WORLD_Z + mz) * WORLD_X + mx];
+            if (stops_ray(blk)) {
+                *hx = mx; *hy = my; *hz = mz;
+                *nx = *ny = *nz = 0;
+                if (side == 0)      *nx = -sx;
+                else if (side == 1) *ny = -sy;
+                else                *nz = -sz;
+                if (outdist)  *outdist  = t;
+                if (outblock) *outblock = blk;
+                return 1;
+            }
+        }
+
+        /* --- 3. advance one block --- */
+        if (sdx < sdy && sdx < sdz) {
+            t = sdx; if (t >= t1) return 0;
+            sdx += ddx; mx += sx; if ((unsigned)mx >= WORLD_X) return 0;
+            side = 0; check_macro = ((mx & (MACRO - 1)) == edge_x);
+        } else if (sdy < sdz) {
+            t = sdy; if (t >= t1) return 0;
+            sdy += ddy; my += sy; if ((unsigned)my >= WORLD_Y) return 0;
+            side = 1; check_macro = ((my & (MACRO - 1)) == edge_y);
+        } else {
+            t = sdz; if (t >= t1) return 0;
+            sdz += ddz; mz += sz; if ((unsigned)mz >= WORLD_Z) return 0;
+            side = 2; check_macro = ((mz & (MACRO - 1)) == edge_z);
         }
     }
-    return 0;
+#undef SEED_DDA
 }
 
 /* ----------------------------------------------------------------------- */
 /* Rendering                                                                */
 /* ----------------------------------------------------------------------- */
 
-static uint32_t shade(uint32_t c, float f) {
-    int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
-    return rgb((int)(r * f), (int)(g * f), (int)(b * f));
-}
+/* Fractional part of a value known to be non-negative. Avoids floorf(), which
+   is an out-of-line libm call on the 32-bit target and runs twice per pixel. */
+static inline float fracp(float v) { return v - (float)(int)v; }
 
-static void render_frame(void) {
-    V3 fwd, right, up;
-    camera_basis(&fwd, &right, &up);
-    float tanf_ = tanf(FOV_DEG * 0.5f * (float)M_PI / 180.0f);
-    float aspect = (float)RENDER_W / RENDER_H;
+/* Per-frame camera state, published once before the worker threads start. */
+static struct {
+    V3    fwd, right, up;
+    float ox, oy, oz;
+    float su0, dsu, tan_v;      /* screen-space ray parameters */
+    int   sky_r[RENDER_H], sky_g[RENDER_H], sky_b[RENDER_H];
+} g_view;
 
-    const uint32_t sky_top = rgb(120, 170, 235);
-    const uint32_t sky_bot = rgb(200, 225, 250);
+#define SKY_BOT_R 200
+#define SKY_BOT_G 225
+#define SKY_BOT_B 250
 
-    for (int y = 0; y < RENDER_H; y++) {
-        float sv = (1.0f - 2.0f * (y + 0.5f) / RENDER_H) * tanf_;
-        for (int x = 0; x < RENDER_W; x++) {
-            float su = (2.0f * (x + 0.5f) / RENDER_W - 1.0f) * tanf_ * aspect;
-            float dx = fwd.x + su * right.x + sv * up.x;
-            float dy = fwd.y + su * right.y + sv * up.y;
-            float dz = fwd.z + su * right.z + sv * up.z;
+/* Renders every ystep'th scanline starting at y0. Splitting the frame between
+   threads by interleaving rows (rather than in contiguous bands) keeps the
+   load even: sky rows cost far more than ground rows. */
+static void render_rows(int y0, int ystep) {
+    const int rw = g_rw, rh = g_rh;
+    const float ox = g_view.ox, oy = g_view.oy, oz = g_view.oz;
+
+    for (int y = y0; y < rh; y += ystep) {
+        float sv = (1.0f - 2.0f * (y + 0.5f) / rh) * g_view.tan_v;
+        /* ray direction = base + su * right, with su exact per pixel */
+        const float bx = g_view.fwd.x + sv * g_view.up.x;
+        const float by = g_view.fwd.y + sv * g_view.up.y;
+        const float bz = g_view.fwd.z + sv * g_view.up.z;
+        const float ux = g_view.right.x, uy = g_view.right.y, uz = g_view.right.z;
+
+        const int skr = g_view.sky_r[y], skg = g_view.sky_g[y], skb = g_view.sky_b[y];
+        uint32_t *row = &g_framebuf[y * rw];
+
+        for (int x = 0; x < rw; x++) {
+            float su = g_view.su0 + x * g_view.dsu;
+            float dx = bx + su * ux, dy = by + su * uy, dz = bz + su * uz;
             float il = 1.0f / sqrtf(dx * dx + dy * dy + dz * dz);
-            dx *= il; dy *= il; dz *= il;
+            float rx = dx * il, ry = dy * il, rz = dz * il;
 
             int hx, hy, hz, nx, ny, nz, blk;
             float dist;
-            uint32_t col;
 
-            if (raycast(g_px, g_py, g_pz, dx, dy, dz, MAX_RAY,
+            if (raycast(ox, oy, oz, rx, ry, rz, MAX_RAY,
                         &hx, &hy, &hz, &nx, &ny, &nz, &dist, &blk)) {
-                /* hit point for texture coords */
-                float hxp = g_px + dx * dist;
-                float hyp = g_py + dy * dist;
-                float hzp = g_pz + dz * dist;
+                float hxp = ox + rx * dist;
+                float hyp = oy + ry * dist;
+                float hzp = oz + rz * dist;
                 float u, v;
                 int face;
-                if (nx != 0)      { u = hzp - floorf(hzp); v = 1 - (hyp - floorf(hyp)); face = 1; }
-                else if (nz != 0) { u = hxp - floorf(hxp); v = 1 - (hyp - floorf(hyp)); face = 1; }
-                else              { u = hxp - floorf(hxp); v = hzp - floorf(hzp);
+                if (nx != 0)      { u = fracp(hzp); v = 1 - fracp(hyp); face = 1; }
+                else if (nz != 0) { u = fracp(hxp); v = 1 - fracp(hyp); face = 1; }
+                else              { u = fracp(hxp); v = fracp(hzp);
                                     face = (ny > 0) ? 0 : 2; }
-                int tu = (int)(u * TEX); if (tu < 0) tu = 0; if (tu >= TEX) tu = TEX - 1;
-                int tv = (int)(v * TEX); if (tv < 0) tv = 0; if (tv >= TEX) tv = TEX - 1;
-                col = g_tex[blk][face][tv * TEX + tu];
+                int tu = (int)(u * TEX); if (tu < 0) tu = 0; else if (tu >= TEX) tu = TEX - 1;
+                int tv = (int)(v * TEX); if (tv < 0) tv = 0; else if (tv >= TEX) tv = TEX - 1;
+                uint32_t c = g_tex[blk][face][tv * TEX + tu];
 
-                /* face lighting */
-                float lf = (ny > 0) ? 1.0f : (ny < 0) ? 0.55f : (nx != 0 ? 0.8f : 0.68f);
-                /* distance fog toward sky */
-                float fog = dist / MAX_RAY; if (fog > 1) fog = 1;
-                col = shade(col, lf);
-                int r = (col >> 16) & 0xff, g = (col >> 8) & 0xff, b = col & 0xff;
-                int sr = (sky_bot >> 16) & 0xff, sg = (sky_bot >> 8) & 0xff, sb = sky_bot & 0xff;
-                col = rgb((int)(r + (sr - r) * fog * 0.85f),
-                          (int)(g + (sg - g) * fog * 0.85f),
-                          (int)(b + (sb - b) * fog * 0.85f));
+                /* face lighting, then distance fog toward the sky colour.
+                   Both factors are <= 1 and both endpoints are bytes, so the
+                   result cannot leave 0..255 and needs no clamping. */
+                float lf  = (ny > 0) ? 1.0f : (ny < 0) ? 0.55f : (nx != 0 ? 0.8f : 0.68f);
+                float fog = dist * (1.0f / MAX_RAY); if (fog > 1.0f) fog = 1.0f;
+                fog *= 0.85f;
+
+                int r = (int)(((c >> 16) & 0xff) * lf);
+                int g = (int)(((c >>  8) & 0xff) * lf);
+                int b = (int)(( c        & 0xff) * lf);
+                r += (int)((SKY_BOT_R - r) * fog);
+                g += (int)((SKY_BOT_G - g) * fog);
+                b += (int)((SKY_BOT_B - b) * fog);
+                row[x] = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
             } else {
-                /* sky gradient */
-                float t = (float)y / RENDER_H;
-                int r1 = (sky_top >> 16) & 0xff, g1 = (sky_top >> 8) & 0xff, b1 = sky_top & 0xff;
-                int r2 = (sky_bot >> 16) & 0xff, g2 = (sky_bot >> 8) & 0xff, b2 = sky_bot & 0xff;
-                col = rgb((int)(r1 + (r2 - r1) * t),
-                          (int)(g1 + (g2 - g1) * t),
-                          (int)(b1 + (b2 - b1) * t));
+                row[x] = 0xff000000u | ((uint32_t)skr << 16) |
+                         ((uint32_t)skg << 8) | (uint32_t)skb;
             }
-            g_framebuf[y * RENDER_W + x] = col;
         }
     }
+}
 
-    /* crosshair */
-    int cxp = RENDER_W / 2, cyp = RENDER_H / 2;
+/* Draws the crosshair and hotbar over the finished frame. */
+static void render_overlay(void) {
+    const int rw = g_rw, rh = g_rh;
+
+    int cxp = rw / 2, cyp = rh / 2;
     for (int i = -5; i <= 5; i++) {
-        g_framebuf[cyp * RENDER_W + (cxp + i)] ^= 0x00ffffff;
-        g_framebuf[(cyp + i) * RENDER_W + cxp] ^= 0x00ffffff;
+        g_framebuf[cyp * rw + (cxp + i)] ^= 0x00ffffff;
+        g_framebuf[(cyp + i) * rw + cxp] ^= 0x00ffffff;
     }
 
     /* hotbar: block ids 1..10 (GLASS = 10), selected slot highlighted */
-    {
-        const int slots = 10, sw = 22, gap = 2;
-        int tot = slots * (sw + gap) - gap;
-        int x0 = (RENDER_W - tot) / 2, y0 = RENDER_H - sw - 6;
-        for (int k = 0; k < slots; k++) {
-            int blk = k + 1;
-            int sxp = x0 + k * (sw + gap);
-            int sel = (blk == g_selected);
-            for (int yy = -2; yy < sw + 2; yy++)
-                for (int xx = -2; xx < sw + 2; xx++) {
-                    int px = sxp + xx, py = y0 + yy;
-                    if (px < 0 || px >= RENDER_W || py < 0 || py >= RENDER_H) continue;
-                    if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
-                        g_framebuf[py * RENDER_W + px] = sel ? 0xffffffffu : 0xff202020u;
-                    else
-                        g_framebuf[py * RENDER_W + px] =
-                            g_tex[blk][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)];
-                }
-        }
+    const int slots = 10, gap = 2;
+    int sw = 22 * rw / RENDER_W; if (sw < 8) sw = 8;   /* scale with render size */
+    int tot = slots * (sw + gap) - gap;
+    int x0 = (rw - tot) / 2, y0 = rh - sw - 6;
+    for (int k = 0; k < slots; k++) {
+        int blk = k + 1;
+        int sxp = x0 + k * (sw + gap);
+        int sel = (blk == g_selected);
+        for (int yy = -2; yy < sw + 2; yy++)
+            for (int xx = -2; xx < sw + 2; xx++) {
+                int px = sxp + xx, py = y0 + yy;
+                if (px < 0 || px >= rw || py < 0 || py >= rh) continue;
+                if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
+                    g_framebuf[py * rw + px] = sel ? 0xffffffffu : 0xff202020u;
+                else
+                    g_framebuf[py * rw + px] =
+                        g_tex[blk][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)];
+            }
     }
+}
+
+/* ----- adaptive resolution ------------------------------------------------
+   The renderer is a software raycaster, so cost scales with the pixel count.
+   Rather than assume a machine speed, the game measures its own frame time and
+   trades internal resolution for frame rate. The image is upscaled to the
+   window either way, so a drop costs sharpness, not framing. */
+#ifndef HEADLESS_TEST
+static const float g_res_scale[] = {1.00f, 0.85f, 0.72f, 0.60f, 0.50f, 0.42f, 0.35f};
+#define RES_LEVELS ((int)(sizeof g_res_scale / sizeof g_res_scale[0]))
+static int g_res_level = 0;
+static int g_autores = 1;
+
+static void set_res_level(int lv) {
+    if (lv < 0) lv = 0;
+    if (lv >= RES_LEVELS) lv = RES_LEVELS - 1;
+    g_res_level = lv;
+    int w = (int)(RENDER_W * g_res_scale[lv]) & ~1;
+    int h = (int)(RENDER_H * g_res_scale[lv]) & ~1;
+    g_rw = w < 64 ? 64 : w;
+    g_rh = h < 36 ? 36 : h;
+}
+#endif /* !HEADLESS_TEST */
+
+/* Fills g_view for the current camera and render size. */
+static void view_setup(void) {
+    camera_basis(&g_view.fwd, &g_view.right, &g_view.up);
+    g_view.ox = g_px; g_view.oy = g_py; g_view.oz = g_pz;
+    g_view.tan_v = tanf(FOV_DEG * 0.5f * (float)M_PI / 180.0f);
+    float ah = g_view.tan_v * ((float)RENDER_W / RENDER_H);
+    g_view.su0 = (2.0f * 0.5f / g_rw - 1.0f) * ah;
+    g_view.dsu = (2.0f / g_rw) * ah;
+
+    const int r1 = 120, g1 = 170, b1 = 235;      /* sky top */
+    for (int y = 0; y < g_rh; y++) {
+        float t = (float)y / g_rh;
+        g_view.sky_r[y] = (int)(r1 + (SKY_BOT_R - r1) * t);
+        g_view.sky_g[y] = (int)(g1 + (SKY_BOT_G - g1) * t);
+        g_view.sky_b[y] = (int)(b1 + (SKY_BOT_B - b1) * t);
+    }
+}
+
+#ifndef HEADLESS_TEST
+/* ----- render worker pool -------------------------------------------------
+   Raycasting is embarrassingly parallel: every scanline is independent and
+   the only shared state (world, textures, camera) is read-only for the whole
+   frame. Worker i renders rows i, i+N, i+2N...; the main thread takes row 0's
+   share itself and then waits for the others. Threads are created once and
+   parked on an event, so a frame costs two kernel handoffs, not N thread
+   creations. */
+static HANDLE g_ev_start[MAX_THREADS];
+static HANDLE g_ev_done[MAX_THREADS];
+static HANDLE g_thread[MAX_THREADS];
+static int    g_nthreads = 1;                 /* including the main thread   */
+static volatile int g_threads_quit = 0;
+
+static DWORD WINAPI render_worker(LPVOID arg) {
+    int id = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(g_ev_start[id], INFINITE);
+        if (g_threads_quit) return 0;
+        render_rows(id, g_nthreads);
+        SetEvent(g_ev_done[id]);
+    }
+}
+
+static void render_threads_init(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors;
+    if (n < 1) n = 1;
+    if (n > MAX_THREADS) n = MAX_THREADS;
+
+    for (int i = 1; i < n; i++) {
+        g_ev_start[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+        g_ev_done[i]  = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (g_ev_start[i] && g_ev_done[i])
+            g_thread[i] = CreateThread(NULL, 0, render_worker, (LPVOID)(intptr_t)i, 0, NULL);
+        if (!g_thread[i]) {                   /* fall back to fewer threads  */
+            if (g_ev_start[i]) { CloseHandle(g_ev_start[i]); g_ev_start[i] = NULL; }
+            if (g_ev_done[i])  { CloseHandle(g_ev_done[i]);  g_ev_done[i]  = NULL; }
+            break;
+        }
+        g_nthreads = i + 1;                   /* only count threads we got   */
+    }
+}
+
+static void render_threads_shutdown(void) {
+    g_threads_quit = 1;
+    for (int i = 1; i < g_nthreads; i++) SetEvent(g_ev_start[i]);
+    for (int i = 1; i < g_nthreads; i++) {
+        if (g_thread[i]) { WaitForSingleObject(g_thread[i], 1000); CloseHandle(g_thread[i]); }
+        if (g_ev_start[i]) CloseHandle(g_ev_start[i]);
+        if (g_ev_done[i])  CloseHandle(g_ev_done[i]);
+    }
+    g_nthreads = 1;
+}
+#endif /* !HEADLESS_TEST */
+
+static void render_frame(void) {
+    view_setup();
+#ifndef HEADLESS_TEST
+    if (g_nthreads > 1) {
+        for (int i = 1; i < g_nthreads; i++) SetEvent(g_ev_start[i]);
+        render_rows(0, g_nthreads);
+        WaitForMultipleObjects(g_nthreads - 1, &g_ev_done[1], TRUE, INFINITE);
+        render_overlay();
+        return;
+    }
+#endif
+    render_rows(0, 1);
+    render_overlay();
 }
 
 /* ----------------------------------------------------------------------- */
@@ -692,6 +998,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (idx < B_COUNT) g_selected = idx;
         }
         if (w == '0') g_selected = B_GLASS;
+        if (w == 'T') g_autores = !g_autores;
+        if (w == VK_OEM_MINUS || w == VK_SUBTRACT) { g_autores = 0; set_res_level(g_res_level + 1); }
+        if (w == VK_OEM_PLUS  || w == VK_ADD)      { g_autores = 0; set_res_level(g_res_level - 1); }
         return 0;
     case WM_KEYUP:
         if (w < 256) g_keys[w] = 0;
@@ -733,21 +1042,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
 
     gen_textures();
     load_assets();
+    render_threads_init();
     gen_world((unsigned)GetTickCount());
     load_world("world.sav");   /* resume a saved world if one exists */
 
-    {
-        char title[128];
-        snprintf(title, sizeof title,
-                 "MiniCraft - voxel sandbox (32/64-bit)  |  %d textures from assets",
-                 g_assets_loaded);
-        SetWindowTextA(g_hwnd, title);
-    }
-
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = RENDER_W;
-    bmi.bmiHeader.biHeight = -RENDER_H;      /* top-down */
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -756,8 +1056,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&prev);
 
-    int mouse_init = 0;
+    int mouse_init = 0, cursor_hidden = 0;
+    float ft_avg = 1.0f / 60.0f;      /* smoothed frame time, seconds */
+    float since_res = 0, since_title = 1e9f;
     HDC hdc = GetDC(g_hwnd);
+    SetStretchBltMode(hdc, COLORONCOLOR);   /* cheapest upscale filter */
 
     while (g_running) {
         MSG msg;
@@ -787,23 +1090,57 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow) {
             }
             int scx, scy; center_mouse(&scx, &scy);
             mouse_init = 1;
-            ShowCursor(FALSE);
+            /* ShowCursor keeps a counter, so this must be edge-triggered --
+               calling it every frame drove the counter to -infinity and left
+               the cursor stuck hidden after alt-tabbing away. */
+            if (!cursor_hidden) { ShowCursor(FALSE); cursor_hidden = 1; }
         } else {
             mouse_init = 0;
-            ShowCursor(TRUE);
+            if (cursor_hidden) { ShowCursor(TRUE); cursor_hidden = 0; }
+            Sleep(20);          /* don't burn a core in the background */
         }
 
         if (g_break_req) { do_break(); g_break_req = 0; }
         if (g_place_req) { do_place(); g_place_req = 0; }
 
         update_player(dt);
+
+        /* --- adaptive resolution ---------------------------------------- */
+        ft_avg += (dt - ft_avg) * 0.1f;
+        since_res += dt;
+        /* Only judge speed while focused -- a backgrounded frame is padded
+           with Sleep() and would drag the resolution down for no reason. */
+        if (g_autores && g_focused && since_res > 0.4f) {
+            if (ft_avg > 1.0f / 45.0f && g_res_level < RES_LEVELS - 1) {
+                set_res_level(g_res_level + 1); since_res = 0;
+            } else if (ft_avg < 1.0f / 110.0f && g_res_level > 0) {
+                set_res_level(g_res_level - 1); since_res = 0;
+            }
+        }
+
         render_frame();
 
+        bmi.bmiHeader.biWidth  =  g_rw;
+        bmi.bmiHeader.biHeight = -g_rh;          /* top-down */
         StretchDIBits(hdc, 0, 0, g_client_w, g_client_h,
-                      0, 0, RENDER_W, RENDER_H,
+                      0, 0, g_rw, g_rh,
                       g_framebuf, &bmi, DIB_RGB_COLORS, SRCCOPY);
+
+        since_title += dt;
+        if (since_title > 0.5f) {
+            char title[192];
+            snprintf(title, sizeof title,
+                     "MiniCraft - voxel sandbox  |  %.0f FPS  |  %dx%d%s  |  "
+                     "%d thread%s  |  %d textures",
+                     ft_avg > 0 ? 1.0f / ft_avg : 0.0f, g_rw, g_rh,
+                     g_autores ? "" : " (locked)",
+                     g_nthreads, g_nthreads == 1 ? "" : "s", g_assets_loaded);
+            SetWindowTextA(g_hwnd, title);
+            since_title = 0;
+        }
     }
 
+    render_threads_shutdown();
     ReleaseDC(g_hwnd, hdc);
     return 0;
 }
