@@ -49,6 +49,7 @@
 #define WORLD_X 128
 #define WORLD_Y 64
 #define WORLD_Z 128
+#define WORLD_CELLS (WORLD_X * WORLD_Y * WORLD_Z)
 #define WATER_LEVEL 22
 
 #define RENDER_W 480          /* internal render resolution (upscaled)      */
@@ -73,18 +74,23 @@ typedef char macro_divides_world[(WORLD_X % MACRO == 0 && WORLD_Y % MACRO == 0 &
 
 #define MAX_THREADS 16        /* upper bound on render worker threads        */
 
-/* Block ids */
-enum {
-    B_AIR = 0, B_GRASS, B_DIRT, B_STONE, B_COBBLE,
-    B_LOG, B_LEAVES, B_SAND, B_PLANKS, B_WATER, B_GLASS,
-    B_COUNT
-};
+/* The item catalogue and everything built on it. A block id in the world *is*
+   an item id, so every placeable entry of the catalogue can be built with. */
+#include "items.h"
+#include "models.h"
+#include "anim.h"
+#include "render3d.h"
+#include "font.h"
+
+#define HOTBAR_SLOTS 10
+#define MAX_DROPS    64       /* item entities lying in the world           */
+#define PICKUP_RANGE 1.6f
 
 /* ----------------------------------------------------------------------- */
 /* Globals                                                                  */
 /* ----------------------------------------------------------------------- */
 
-static uint8_t  g_world[WORLD_X * WORLD_Y * WORLD_Z];
+static uint16_t g_world[WORLD_X * WORLD_Y * WORLD_Z];
 
 /* Coarse occupancy grid: g_macro[c] is nonzero when macro cell c contains at
    least one ray-stopping block. A zero cell is guaranteed empty, which lets
@@ -98,14 +104,39 @@ static uint32_t g_framebuf[RENDER_W * RENDER_H];
    resolution controller lowers it when frames get expensive. Rows are packed
    at stride g_rw. */
 static int g_rw = RENDER_W, g_rh = RENDER_H;
-static uint32_t g_tex[B_COUNT][3][TEX * TEX];   /* [block][face 0=top,1=side,2=bottom] */
+
+/* Per-pixel distance from the raycast pass. Item entities are rasterised
+   afterwards and depth-test against it, so a dropped item is hidden by the
+   terrain in front of it. */
+static float g_depth[RENDER_W * RENDER_H];
 
 static float g_px = WORLD_X * 0.5f, g_py = 40.0f, g_pz = WORLD_Z * 0.5f;
 static float g_vx = 0, g_vy = 0, g_vz = 0;
 static float g_yaw = 0.0f, g_pitch = 0.0f;
 static int   g_onground = 0;
 static int   g_fly = 0;
-static int   g_selected = B_STONE;
+
+/* Free-running clock that drives every animation and texture animation. */
+static float g_time = 0.0f;
+
+/* Hotbar: ten catalogue entries, one of them selected. */
+static int g_hotbar[HOTBAR_SLOTS];
+static int g_slot = 0;
+#define g_selected (g_hotbar[g_slot])
+
+/* The one-shot clip currently playing on the held item. */
+static int   g_use_clip = ANIM_NONE;
+static float g_use_time = 0.0f;
+
+/* Item entities: what a broken block leaves behind. */
+typedef struct {
+    int   item;
+    float x, y, z, vy;
+    float age;
+    int   alive;
+} Drop;
+static Drop g_drops[MAX_DROPS];
+static int  g_drop_count = 0;
 
 static int   g_keys[256];
 static int   g_running = 1;
@@ -127,12 +158,15 @@ static volatile int g_place_req = 0;
 static inline int in_world(int x, int y, int z) {
     return x >= 0 && x < WORLD_X && y >= 0 && y < WORLD_Y && z >= 0 && z < WORLD_Z;
 }
-static inline uint8_t get_block(int x, int y, int z) {
-    if (!in_world(x, y, z)) return B_AIR;
+static inline uint16_t get_block(int x, int y, int z) {
+    if (!in_world(x, y, z)) return IT_AIR;
     return g_world[(y * WORLD_Z + z) * WORLD_X + x];
 }
-static inline int stops_ray(uint8_t b) {
-    return b != B_AIR && b != B_WATER;   /* water is passable */
+/* Anything that isn't air or a liquid may stop a ray. Partial models are
+   included: the macro grid has to be conservative, and the raycaster then
+   intersects the model's boxes for the exact answer. */
+static inline int stops_ray(int b) {
+    return b != IT_AIR && !item_is_liquid(b);
 }
 
 /* Recompute one macro cell from the blocks it covers. */
@@ -152,7 +186,7 @@ static void macro_rebuild_all(void) {
                 macro_rebuild_cell(mx, my, mz);
 }
 
-static inline void set_block(int x, int y, int z, uint8_t v) {
+static inline void set_block(int x, int y, int z, uint16_t v) {
     if (!in_world(x, y, z)) return;
     g_world[(y * WORLD_Z + z) * WORLD_X + x] = v;
     if (g_macro_defer) return;                 /* caller rebuilds afterwards */
@@ -161,8 +195,10 @@ static inline void set_block(int x, int y, int z, uint8_t v) {
     else if (g_macro[m]) macro_rebuild_cell(x / MACRO, y / MACRO, z / MACRO);
 }
 
+/* "Is there anything to stand on here" -- a cheap per-cell test. The exact
+   shape is only consulted by collide(), which tests the model's boxes. */
 static inline int is_solid(int x, int y, int z) {
-    return stops_ray(get_block(x, y, z));
+    return item_is_solid(get_block(x, y, z));
 }
 
 /* ----------------------------------------------------------------------- */
@@ -202,9 +238,28 @@ static float fbm(float x, float y) {
 
 static int collide(float ex, float ey, float ez);   /* forward decl */
 
+/* Which wood a tree is made of, so the world shows off more than one entry of
+   the catalogue. Keyed off position, so a given seed is reproducible. */
+static const uint16_t g_tree_kinds[5][2] = {
+    { IT_OAK_LOG,     IT_OAK_LEAVES     },
+    { IT_BIRCH_LOG,   IT_BIRCH_LEAVES   },
+    { IT_SPRUCE_LOG,  IT_SPRUCE_LEAVES  },
+    { IT_ACACIA_LOG,  IT_ACACIA_LEAVES  },
+    { IT_CHERRY_LOG,  IT_CHERRY_LEAVES  },
+};
+
+/* Scattered ground cover, drawn with the cross model. */
+static const uint16_t g_flora[8] = {
+    IT_SHORT_GRASS_GRASS, IT_POPPY, IT_DANDELION, IT_CORNFLOWER,
+    IT_AZURE_BLUET, IT_OXEYE_DAISY, IT_ALLIUM, IT_FERN,
+};
+
 static void place_tree(int x, int z, int ground) {
+    int kind = (int)(rnd2(x * 31 + 7, z * 19 + 3) * 5.0f);
+    if (kind > 4) kind = 4;
+    uint16_t log = g_tree_kinds[kind][0], leaf = g_tree_kinds[kind][1];
     int h = 4 + (int)(rnd2(x * 7, z * 3) * 3.0f);
-    for (int i = 1; i <= h; i++) set_block(x, ground + i, z, B_LOG);
+    for (int i = 1; i <= h; i++) set_block(x, ground + i, z, log);
     int top = ground + h;
     for (int dy = -1; dy <= 2; dy++) {
         int r = (dy <= 0) ? 2 : 1;
@@ -213,14 +268,14 @@ static void place_tree(int x, int z, int ground) {
                 if (dx == 0 && dz == 0 && dy <= 0) continue;
                 if (abs(dx) == r && abs(dz) == r && (rnd2(x + dx, z + dz) < 0.4f)) continue;
                 int yy = top + dy;
-                if (get_block(x + dx, yy, z + dz) == B_AIR)
-                    set_block(x + dx, yy, z + dz, B_LEAVES);
+                if (get_block(x + dx, yy, z + dz) == IT_AIR)
+                    set_block(x + dx, yy, z + dz, leaf);
             }
     }
 }
 
 static void gen_world(unsigned seed) {
-    for (unsigned i = 0; i < sizeof(g_world); i++) g_world[i] = B_AIR;
+    for (unsigned i = 0; i < WORLD_CELLS; i++) g_world[i] = IT_AIR;
     g_macro_defer = 1;                 /* one rebuild at the end, not 1M */
     float ox = (seed % 997) * 1.3f, oz = (seed % 733) * 1.7f;
 
@@ -231,30 +286,35 @@ static void gen_world(unsigned seed) {
             if (h < 1) h = 1;
             if (h >= WORLD_Y) h = WORLD_Y - 1;
             for (int y = 0; y <= h; y++) {
-                uint8_t b;
+                uint16_t b;
                 if (y == h) {
-                    if (h <= WATER_LEVEL + 1) b = B_SAND;
-                    else b = B_GRASS;
+                    if (h <= WATER_LEVEL + 1) b = IT_SAND;
+                    else b = IT_GRASS_BLOCK;
                 } else if (y >= h - 3) {
-                    b = (h <= WATER_LEVEL + 1) ? B_SAND : B_DIRT;
+                    b = (h <= WATER_LEVEL + 1) ? IT_SAND : IT_DIRT;
                 } else {
-                    b = B_STONE;
+                    b = IT_STONE;
                 }
                 set_block(x, y, z, b);
             }
             /* water fill */
-            for (int y = h + 1; y <= WATER_LEVEL; y++) set_block(x, y, z, B_WATER);
+            for (int y = h + 1; y <= WATER_LEVEL; y++) set_block(x, y, z, IT_WATER);
         }
     }
-    /* trees on grass above water */
+    /* trees and ground cover on grass above water */
     for (int x = 3; x < WORLD_X - 3; x++)
         for (int z = 3; z < WORLD_Z - 3; z++) {
             /* find surface */
             int y = WORLD_Y - 1;
-            while (y > 0 && get_block(x, y, z) == B_AIR) y--;
-            if (get_block(x, y, z) == B_GRASS && y > WATER_LEVEL + 1 &&
-                rnd2(x * 13 + 1, z * 17 + 5) < 0.018f)
+            while (y > 0 && get_block(x, y, z) == IT_AIR) y--;
+            if (get_block(x, y, z) != IT_GRASS_BLOCK || y <= WATER_LEVEL + 1)
+                continue;
+            float r = rnd2(x * 13 + 1, z * 17 + 5);
+            if (r < 0.018f)
                 place_tree(x, z, y);
+            else if (r > 0.90f && get_block(x, y + 1, z) == IT_AIR)
+                set_block(x, y + 1, z,
+                          g_flora[(int)(rnd2(x * 5 + 3, z * 11 + 9) * 8.0f) & 7]);
         }
 
     g_macro_defer = 0;
@@ -271,152 +331,77 @@ static void gen_world(unsigned seed) {
 }
 
 /* ----------------------------------------------------------------------- */
-/* Procedural textures                                                      */
-/* ----------------------------------------------------------------------- */
-
-static uint32_t rgb(int r, int g, int b) {
-    if (r < 0) r = 0;
-    if (r > 255) r = 255;
-    if (g < 0) g = 0;
-    if (g > 255) g = 255;
-    if (b < 0) b = 0;
-    if (b > 255) b = 255;
-    return 0xff000000u | (r << 16) | (g << 8) | b;
-}
-
-static void fill_tex(uint32_t *t, int br, int bg, int bb, int noise, unsigned salt) {
-    for (int y = 0; y < TEX; y++)
-        for (int x = 0; x < TEX; x++) {
-            int n = (int)((rnd2(x + salt * 31, y + salt * 71) - 0.5f) * 2 * noise);
-            t[y * TEX + x] = rgb(br + n, bg + n, bb + n);
-        }
-}
-
-static void gen_textures(void) {
-    /* grass top */
-    fill_tex(g_tex[B_GRASS][0], 86, 140, 55, 22, 1);
-    /* grass side: dirt with green cap */
-    fill_tex(g_tex[B_GRASS][1], 120, 90, 60, 18, 2);
-    for (int x = 0; x < TEX; x++) {
-        int cap = 3 + (int)(rnd2(x, 99) * 2);
-        for (int y = 0; y < cap; y++) {
-            int n = (int)((rnd2(x + 5, y + 5) - 0.5f) * 30);
-            g_tex[B_GRASS][1][y * TEX + x] = rgb(86 + n, 140 + n, 55 + n);
-        }
-    }
-    /* grass bottom = dirt */
-    fill_tex(g_tex[B_GRASS][2], 120, 90, 60, 18, 2);
-
-    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_DIRT][f], 120, 90, 60, 18, 3);
-    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_STONE][f], 128, 128, 132, 16, 4);
-
-    /* cobblestone: stone base + darker mortar speckle */
-    for (int f = 0; f < 3; f++) {
-        fill_tex(g_tex[B_COBBLE][f], 120, 120, 124, 20, 9);
-        for (int y = 0; y < TEX; y++)
-            for (int x = 0; x < TEX; x++)
-                if (((x + y) % 5) == 0 || rnd2(x * 3, y * 3 + f) < 0.10f)
-                    g_tex[B_COBBLE][f][y * TEX + x] = rgb(80, 80, 84);
-    }
-
-    /* log: side = bark streaks, top/bottom = rings */
-    fill_tex(g_tex[B_LOG][1], 105, 78, 44, 14, 5);
-    for (int x = 0; x < TEX; x++)
-        if ((x % 4) == 0)
-            for (int y = 0; y < TEX; y++)
-                g_tex[B_LOG][1][y * TEX + x] = rgb(78, 56, 30);
-    for (int f = 0; f < 3; f += 2) {  /* top(0) and bottom(2) */
-        for (int y = 0; y < TEX; y++)
-            for (int x = 0; x < TEX; x++) {
-                float dx = x - 7.5f, dy = y - 7.5f;
-                float d = sqrtf(dx * dx + dy * dy);
-                int ring = ((int)(d) % 2) ? 20 : 0;
-                g_tex[B_LOG][f][y * TEX + x] = rgb(150 - ring, 118 - ring, 70 - ring);
-            }
-    }
-
-    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_LEAVES][f], 48, 96, 40, 26, 6);
-    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_SAND][f], 216, 204, 156, 14, 7);
-
-    /* planks: tan with horizontal seams */
-    for (int f = 0; f < 3; f++) {
-        fill_tex(g_tex[B_PLANKS][f], 176, 140, 90, 14, 8);
-        for (int y = 0; y < TEX; y++)
-            if ((y % 4) == 0)
-                for (int x = 0; x < TEX; x++)
-                    g_tex[B_PLANKS][f][y * TEX + x] = rgb(130, 100, 60);
-    }
-
-    for (int f = 0; f < 3; f++) fill_tex(g_tex[B_WATER][f], 48, 90, 200, 16, 10);
-
-    /* glass: light, with border frame */
-    for (int f = 0; f < 3; f++) {
-        for (int y = 0; y < TEX; y++)
-            for (int x = 0; x < TEX; x++) {
-                int edge = (x == 0 || y == 0 || x == TEX - 1 || y == TEX - 1);
-                g_tex[B_GLASS][f][y * TEX + x] = edge ? rgb(200, 220, 230) : rgb(170, 200, 215);
-            }
-    }
-}
-
-/* ----------------------------------------------------------------------- */
-/* Asset loading (Minecraft-format resource pack)                           */
+/* Textures                                                                 */
 /*                                                                          */
-/* At startup the game looks for real textures under                        */
-/*   assets/minecraft/textures/block/<name>.png                             */
-/* and uses them in place of the procedural fallback. Grayscale textures    */
-/* that Minecraft tints by biome (grass, leaves) get a tint applied here,   */
-/* so a stock Minecraft resource pack renders with sensible colours.        */
+/* Every catalogue entry's texture is synthesised at startup from its        */
+/* pattern and colours (see items.h). A real Minecraft-format resource pack  */
+/* still wins where one exists: load_assets() slugifies the item name and    */
+/* looks for assets/minecraft/textures/{block,item}/<name>{,_top,_side,      */
+/* _bottom}.png, so dropping a pack next to the executable replaces as much  */
+/* of the generated art as the pack happens to cover.                       */
 /* ----------------------------------------------------------------------- */
 
-struct texref { const char *name; uint32_t tint; };   /* tint 0 = none */
+static void gen_textures(void) { build_item_textures(); }
 
-static const struct texref g_texmap[B_COUNT][3] = {
-    /*            top                              side                          bottom            */
-    [B_GRASS]  = {{"grass_block_top", 0x91BD59}, {"grass_block_side", 0},     {"dirt", 0}},
-    [B_DIRT]   = {{"dirt", 0},                   {"dirt", 0},                 {"dirt", 0}},
-    [B_STONE]  = {{"stone", 0},                  {"stone", 0},                {"stone", 0}},
-    [B_COBBLE] = {{"cobblestone", 0},            {"cobblestone", 0},          {"cobblestone", 0}},
-    [B_LOG]    = {{"oak_log_top", 0},            {"oak_log", 0},              {"oak_log_top", 0}},
-    [B_LEAVES] = {{"oak_leaves", 0x59AE30},      {"oak_leaves", 0x59AE30},    {"oak_leaves", 0x59AE30}},
-    [B_SAND]   = {{"sand", 0},                   {"sand", 0},                 {"sand", 0}},
-    [B_PLANKS] = {{"oak_planks", 0},             {"oak_planks", 0},           {"oak_planks", 0}},
-    [B_WATER]  = {{"water_still", 0},            {"water_still", 0},          {"water_still", 0}},
-    [B_GLASS]  = {{"glass", 0},                  {"glass", 0},                {"glass", 0}},
-};
+static int g_assets_loaded = 0;   /* number of texture slots loaded from disk */
 
-static int g_assets_loaded = 0;   /* number of textures loaded from disk */
-
-static void apply_tint(uint32_t *t, uint32_t tint) {
-    if (!tint) return;
-    int tr = (tint >> 16) & 0xff, tg = (tint >> 8) & 0xff, tb = tint & 0xff;
-    for (int i = 0; i < TEX * TEX; i++) {
-        uint32_t c = t[i];
-        int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
-        t[i] = 0xff000000u | (((r * tr) / 255) << 16) | (((g * tg) / 255) << 8) | ((b * tb) / 255);
+/* "Grass Block" -> "grass_block"; "Bottle o' Enchanting" -> "bottle_o_enchanting" */
+static void item_slug(int id, char *out, size_t n) {
+    const char *s = item_name(id);
+    size_t o = 0;
+    int prev_us = 1;
+    for (; *s && o + 1 < n; s++) {
+        char c = *s;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            out[o++] = c; prev_us = 0;
+        } else if (!prev_us) {
+            out[o++] = '_'; prev_us = 1;
+        }
     }
+    while (o > 0 && out[o - 1] == '_') o--;
+    out[o] = 0;
 }
 
-static int load_one(const char *base, int blk, int face, uint32_t tint) {
-    const char *name = g_texmap[blk][face].name;
-    if (!name) return 0;
-    char path[600];
-    snprintf(path, sizeof path, "%sassets/minecraft/textures/block/%s.png", base, name);
+/* Loads one PNG into a texture layer, scaling it to 16x16 and taking the
+   first frame of an animated strip. Returns 1 on success. */
+static int load_layer(const char *path, uint32_t *dst, uint32_t tint) {
     int w, h;
     uint32_t *img = png_load(path, &w, &h);
     if (!img) return 0;
     int frame_h = (h >= w) ? w : h;       /* animated strips: use first frame */
+    if (frame_h < 1) frame_h = 1;
     for (int y = 0; y < TEX; y++)
         for (int x = 0; x < TEX; x++) {
-            int sx = x * w / TEX;
-            int sy = y * frame_h / TEX;
+            int sx = x * w / TEX, sy = y * frame_h / TEX;
             if (sx >= w) sx = w - 1;
             if (sy >= h) sy = h - 1;
-            g_tex[blk][face][y * TEX + x] = img[sy * w + sx] | 0xff000000u;
+            uint32_t c = img[sy * w + sx];
+            if (tint) {
+                int tr = (tint >> 16) & 0xff, tg = (tint >> 8) & 0xff, tb = tint & 0xff;
+                int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+                c = (c & 0xff000000u) | (uint32_t)(((r * tr) / 255) << 16) |
+                    (uint32_t)(((g * tg) / 255) << 8) | (uint32_t)((b * tb) / 255);
+            }
+            dst[y * TEX + x] = c;
         }
     free(img);
-    apply_tint(g_tex[blk][face], tint);
     return 1;
+}
+
+/* Does a pack live under `base`? Probing a handful of names is much cheaper
+   than letting 1712 items each miss on three candidate directories. */
+static int pack_present(const char *base) {
+    static const char *probe[] = { "stone", "dirt", "sand", "cobblestone",
+                                   "oak_planks", "glass", "grass_block_top" };
+    for (unsigned i = 0; i < sizeof probe / sizeof probe[0]; i++) {
+        char path[700];
+        snprintf(path, sizeof path,
+                 "%sassets/minecraft/textures/block/%s.png", base, probe[i]);
+        FILE *f = fopen(path, "rb");
+        if (f) { fclose(f); return 1; }
+    }
+    return 0;
 }
 
 static void load_assets(void) {
@@ -435,32 +420,75 @@ static void load_assets(void) {
     bases[nb++] = "../";    /* running from dist/ next to repo root */
 
     g_assets_loaded = 0;
-    for (int b = B_GRASS; b < B_COUNT; b++)
-        for (int f = 0; f < 3; f++) {
-            if (!g_texmap[b][f].name) continue;
-            for (int bi = 0; bi < nb; bi++)
-                if (load_one(bases[bi], b, f, g_texmap[b][f].tint)) { g_assets_loaded++; break; }
+    const char *base = NULL;
+    for (int i = 0; i < nb && !base; i++)
+        if (pack_present(bases[i])) base = bases[i];
+    if (!base) return;                       /* no pack: keep the generated art */
+
+    static const char *suffix[3] = { "_top", "_side", "_bottom" };
+    for (int id = 1; id < ITEM_COUNT; id++) {
+        const ItemDef *d = &g_items[id];
+        if (d->flags & IF_HIDDEN) continue;
+        const char *sub = item_is_placeable(id) ? "block" : "item";
+        char slug[128];
+        item_slug(id, slug, sizeof slug);
+        if (!slug[0]) continue;
+
+        /* Minecraft's grass and foliage textures are greyscale and tinted by
+           biome; using the catalogue colour as the tint keeps a stock pack
+           looking right. */
+        uint32_t tint = 0;
+        if (d->pattern == PAT_FOLIAGE || id == IT_GRASS_BLOCK)
+            tint = d->col_side & 0x00ffffffu;
+
+        for (int face = 0; face < 3; face++) {
+            char path[700];
+            uint32_t px[TEX * TEX];
+            snprintf(path, sizeof path, "%sassets/minecraft/textures/%s/%s%s.png",
+                     base, sub, slug, suffix[face]);
+            if (!load_layer(path, px, tint)) {
+                snprintf(path, sizeof path, "%sassets/minecraft/textures/%s/%s.png",
+                         base, sub, slug);
+                if (!load_layer(path, px, tint)) continue;
+            }
+            /* Layers are shared between items that resolved to the same
+               material, so a pack texture has to land in a private copy or it
+               would repaint every one of them. */
+            uint16_t layer = layer_private(id, face);
+            if (!layer) continue;                 /* pool exhausted */
+            memcpy(g_layers[layer], px, sizeof px);
+            g_assets_loaded++;
         }
+    }
 }
 
 /* ----------------------------------------------------------------------- */
 /* World save / load (simple RLE-compressed save file)                      */
 /* ----------------------------------------------------------------------- */
 
+/* Block ids used to be 8 bit, when the game had eleven blocks. They are item
+   ids now, so the save format carries 16 bits per run -- but a "MCW1" file
+   from the old build still loads, through this table. */
+static const uint16_t g_legacy_ids[11] = {
+    IT_AIR, IT_GRASS_BLOCK, IT_DIRT, IT_STONE, IT_COBBLESTONE, IT_OAK_LOG,
+    IT_OAK_LEAVES, IT_SAND, IT_OAK_PLANKS, IT_WATER, IT_GLASS,
+};
+
 static int save_world(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fwrite("MCW1", 1, 4, f);
+    fwrite("MCW2", 1, 4, f);
     int dims[3] = {WORLD_X, WORLD_Y, WORLD_Z};
     fwrite(dims, sizeof(int), 3, f);
     float ps[5] = {g_px, g_py, g_pz, g_yaw, g_pitch};
     fwrite(ps, sizeof(float), 5, f);
-    unsigned i = 0, total = (unsigned)sizeof(g_world);
+    fwrite(g_hotbar, sizeof(int), HOTBAR_SLOTS, f);
+    unsigned i = 0, total = WORLD_CELLS;
     while (i < total) {                     /* run-length encode block ids */
-        uint8_t v = g_world[i];
+        uint16_t v = g_world[i];
         unsigned run = 1;
         while (i + run < total && g_world[i + run] == v && run < 0xffffffu) run++;
-        fputc(v, f);
+        fputc(v & 0xff, f); fputc((v >> 8) & 0xff, f);
         fputc(run & 0xff, f); fputc((run >> 8) & 0xff, f); fputc((run >> 16) & 0xff, f);
         i += run;
     }
@@ -472,17 +500,27 @@ static int load_world(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     char magic[4]; int dims[3]; float ps[5];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MCW1", 4) != 0) { fclose(f); return 0; }
+    if (fread(magic, 1, 4, f) != 4) { fclose(f); return 0; }
+    int v2 = memcmp(magic, "MCW2", 4) == 0;
+    int v1 = memcmp(magic, "MCW1", 4) == 0;
+    if (!v1 && !v2) { fclose(f); return 0; }
     if (fread(dims, sizeof(int), 3, f) != 3 ||
         dims[0] != WORLD_X || dims[1] != WORLD_Y || dims[2] != WORLD_Z) { fclose(f); return 0; }
     if (fread(ps, sizeof(float), 5, f) != 5) { fclose(f); return 0; }
-    unsigned i = 0, total = (unsigned)sizeof(g_world);
+    int hotbar[HOTBAR_SLOTS];
+    int have_hotbar = v2 && fread(hotbar, sizeof(int), HOTBAR_SLOTS, f) == HOTBAR_SLOTS;
+
+    unsigned i = 0, total = WORLD_CELLS;
     while (i < total) {
-        int v = fgetc(f);
+        int lo = fgetc(f);
+        int hi = v2 ? fgetc(f) : 0;
         int b0 = fgetc(f), b1 = fgetc(f), b2 = fgetc(f);
-        if (v < 0 || b2 < 0) break;
+        if (lo < 0 || hi < 0 || b2 < 0) break;
+        unsigned id = (unsigned)lo | ((unsigned)hi << 8);
+        if (v1) id = (id < 11) ? g_legacy_ids[id] : IT_AIR;
+        if (id >= ITEM_COUNT) id = IT_AIR;
         unsigned run = (unsigned)b0 | ((unsigned)b1 << 8) | ((unsigned)b2 << 16);
-        while (run-- && i < total) g_world[i++] = (uint8_t)v;
+        while (run-- && i < total) g_world[i++] = (uint16_t)id;
     }
     fclose(f);
     macro_rebuild_all();            /* g_world was written directly, even on a
@@ -490,6 +528,10 @@ static int load_world(const char *path) {
     if (i != total) return 0;
     g_px = ps[0]; g_py = ps[1]; g_pz = ps[2]; g_yaw = ps[3]; g_pitch = ps[4];
     g_vx = g_vy = g_vz = 0; g_onground = 0;
+    if (have_hotbar)
+        for (int s = 0; s < HOTBAR_SLOTS; s++)
+            if (hotbar[s] > 0 && hotbar[s] < ITEM_COUNT && item_is_placeable(hotbar[s]))
+                g_hotbar[s] = hotbar[s];
     return 1;
 }
 
@@ -632,16 +674,30 @@ static int raycast(float ox, float oy, float oz, float dx, float dy, float dz,
 
         /* --- 2. test the cell we are in --- */
         if (side >= 0) {
-            uint8_t blk = g_world[(my * WORLD_Z + mz) * WORLD_X + mx];
+            uint16_t blk = g_world[(my * WORLD_Z + mz) * WORLD_X + mx];
             if (stops_ray(blk)) {
-                *hx = mx; *hy = my; *hz = mz;
-                *nx = *ny = *nz = 0;
-                if (side == 0)      *nx = -sx;
-                else if (side == 1) *ny = -sy;
-                else                *nz = -sz;
-                if (outdist)  *outdist  = t;
-                if (outblock) *outblock = blk;
-                return 1;
+                if (item_is_full_cube(blk)) {
+                    *hx = mx; *hy = my; *hz = mz;
+                    *nx = *ny = *nz = 0;
+                    if (side == 0)      *nx = -sx;
+                    else if (side == 1) *ny = -sy;
+                    else                *nz = -sz;
+                    if (outdist)  *outdist  = t;
+                    if (outblock) *outblock = blk;
+                    return 1;
+                }
+                /* Partial model: intersect its boxes. A miss (the ray passed
+                   through the gap beside a torch, or through a transparent
+                   texel of a plant) just continues the traversal. */
+                float bt; int bnx, bny, bnz;
+                if (model_ray_hit(blk, mx, my, mz, ox, oy, oz, ix, iy, iz,
+                                  t1, &bt, &bnx, &bny, &bnz)) {
+                    *hx = mx; *hy = my; *hz = mz;
+                    *nx = bnx; *ny = bny; *nz = bnz;
+                    if (outdist)  *outdist  = bt;
+                    if (outblock) *outblock = blk;
+                    return 1;
+                }
             }
         }
 
@@ -670,6 +726,10 @@ static int raycast(float ox, float oy, float oz, float dx, float dy, float dz,
 /* Fractional part of a value known to be non-negative. Avoids floorf(), which
    is an out-of-line libm call on the 32-bit target and runs twice per pixel. */
 static inline float fracp(float v) { return v - (float)(int)v; }
+
+/* Texture-animation phase for this frame, published once so every worker
+   thread animates in step. */
+static float g_tex_phase = 0.0f;
 
 /* Per-frame camera state, published once before the worker threads start. */
 static struct {
@@ -700,6 +760,7 @@ static void render_rows(int y0, int ystep) {
 
         const int skr = g_view.sky_r[y], skg = g_view.sky_g[y], skb = g_view.sky_b[y];
         uint32_t *row = &g_framebuf[y * rw];
+        float    *drow = &g_depth[y * rw];
 
         for (int x = 0; x < rw; x++) {
             float su = g_view.su0 + x * g_view.dsu;
@@ -723,31 +784,297 @@ static void render_rows(int y0, int ystep) {
                                     face = (ny > 0) ? 0 : 2; }
                 int tu = (int)(u * TEX); if (tu < 0) tu = 0; else if (tu >= TEX) tu = TEX - 1;
                 int tv = (int)(v * TEX); if (tv < 0) tv = 0; else if (tv >= TEX) tv = TEX - 1;
-                uint32_t c = g_tex[blk][face][tv * TEX + tu];
+                uint32_t c = item_sample(blk, face, tu, tv, g_tex_phase);
 
                 /* face lighting, then distance fog toward the sky colour.
                    Both factors are <= 1 and both endpoints are bytes, so the
-                   result cannot leave 0..255 and needs no clamping. */
+                   result cannot leave 0..255 and needs no clamping. A block
+                   that emits light lifts its own faces out of the shading. */
                 float lf  = (ny > 0) ? 1.0f : (ny < 0) ? 0.55f : (nx != 0 ? 0.8f : 0.68f);
+                int   lit = item_light(blk);
+                if (lit) {
+                    float e = 0.6f + lit * (0.4f / 15.0f);
+                    if (e > lf) lf = e;
+                }
                 float fog = dist * (1.0f / MAX_RAY); if (fog > 1.0f) fog = 1.0f;
                 fog *= 0.85f;
 
                 int r = (int)(((c >> 16) & 0xff) * lf);
                 int g = (int)(((c >>  8) & 0xff) * lf);
                 int b = (int)(( c        & 0xff) * lf);
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
                 r += (int)((SKY_BOT_R - r) * fog);
                 g += (int)((SKY_BOT_G - g) * fog);
                 b += (int)((SKY_BOT_B - b) * fog);
                 row[x] = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                drow[x] = dist;
             } else {
                 row[x] = 0xff000000u | ((uint32_t)skr << 16) |
                          ((uint32_t)skg << 8) | (uint32_t)skb;
+                drow[x] = 1e30f;
             }
         }
     }
 }
 
-/* Draws the crosshair and hotbar over the finished frame. */
+/* ----------------------------------------------------------------------- */
+/* Item entities                                                            */
+/*                                                                          */
+/* Breaking a block leaves the item lying in the world, turning on the spot  */
+/* (the ANIM_SPIN clip) until you walk over it.                             */
+/* ----------------------------------------------------------------------- */
+
+static void drops_clear(void) {
+    for (int i = 0; i < MAX_DROPS; i++) g_drops[i].alive = 0;
+    g_drop_count = 0;
+}
+
+static void drop_spawn(int item, float x, float y, float z) {
+    if (item <= IT_AIR || item >= ITEM_COUNT) return;
+    for (int i = 0; i < MAX_DROPS; i++) {
+        if (g_drops[i].alive) continue;
+        g_drops[i].item = item;
+        g_drops[i].x = x; g_drops[i].y = y; g_drops[i].z = z;
+        g_drops[i].vy = 0.0f;
+        g_drops[i].age = 0.0f;
+        g_drops[i].alive = 1;
+        g_drop_count++;
+        return;
+    }
+    /* all slots busy: replace the oldest, so the newest break is never lost */
+    int oldest = 0;
+    for (int i = 1; i < MAX_DROPS; i++)
+        if (g_drops[i].age > g_drops[oldest].age) oldest = i;
+    g_drops[oldest].item = item;
+    g_drops[oldest].x = x; g_drops[oldest].y = y; g_drops[oldest].z = z;
+    g_drops[oldest].vy = 0.0f; g_drops[oldest].age = 0.0f;
+}
+
+/* Puts an item into the hotbar: the current slot if it is empty or already
+   holds it, otherwise the first free slot, otherwise the current slot. */
+static void hotbar_take(int item) {
+    if (!item_is_placeable(item)) return;
+    for (int s = 0; s < HOTBAR_SLOTS; s++)
+        if (g_hotbar[s] == item) { g_slot = s; return; }
+    for (int s = 0; s < HOTBAR_SLOTS; s++)
+        if (g_hotbar[s] == IT_AIR) { g_hotbar[s] = item; g_slot = s; return; }
+    g_hotbar[g_slot] = item;
+}
+
+static void drops_update(float dt) {
+    for (int i = 0; i < MAX_DROPS; i++) {
+        Drop *d = &g_drops[i];
+        if (!d->alive) continue;
+        d->age += dt;
+
+        d->vy -= 18.0f * dt;
+        float ny = d->y + d->vy * dt;
+        if (is_solid((int)floorf(d->x), (int)floorf(ny - 0.15f), (int)floorf(d->z))) {
+            d->y = floorf(ny - 0.15f) + 1.15f;
+            d->vy = 0.0f;
+        } else {
+            d->y = ny;
+        }
+        if (d->y < -10.0f) { d->alive = 0; g_drop_count--; continue; }
+
+        float dx = d->x - g_px, dy = d->y - (g_py - 0.8f), dz = d->z - g_pz;
+        if (d->age > 0.4f &&
+            dx * dx + dy * dy + dz * dz < PICKUP_RANGE * PICKUP_RANGE) {
+            hotbar_take(d->item);
+            d->alive = 0;
+            g_drop_count--;
+        }
+    }
+}
+
+/* Fills a CamView from this frame's camera, for the entity rasteriser. */
+static void cam_view(CamView *c) {
+    c->ox = g_view.ox; c->oy = g_view.oy; c->oz = g_view.oz;
+    c->fx = g_view.fwd.x;   c->fy = g_view.fwd.y;   c->fz = g_view.fwd.z;
+    c->rx = g_view.right.x; c->ry = g_view.right.y; c->rz = g_view.right.z;
+    c->ux = g_view.up.x;    c->uy = g_view.up.y;    c->uz = g_view.up.z;
+    c->su0 = g_view.su0; c->dsu = g_view.dsu; c->tan_v = g_view.tan_v;
+    c->w = g_rw; c->h = g_rh;
+}
+
+static void render_drops(void) {
+    if (!g_drop_count) return;
+    CamView cam;
+    cam_view(&cam);
+    for (int i = 0; i < MAX_DROPS; i++) {
+        Drop *d = &g_drops[i];
+        if (!d->alive) continue;
+        Pose p;
+        anim_pose(ANIM_SPIN, d->age, &p);
+        float bright = 1.0f;
+        if (item_light(d->item)) bright = 1.25f;
+        draw_item_world(g_framebuf, g_depth, &cam, d->item, &p,
+                        d->x, d->y, d->z, 0.30f, g_tex_phase, bright);
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* Inventory                                                                */
+/*                                                                          */
+/* 1712 entries do not fit on a screen, so the inventory is a filtered grid: */
+/* type to search by name, Tab to cycle categories, PgUp/PgDn to page.       */
+/* ----------------------------------------------------------------------- */
+
+#define INV_COLS 9
+#define INV_ROWS 6
+#define INV_PAGE (INV_COLS * INV_ROWS)
+
+static int  g_inv_open = 0;
+static char g_inv_search[24];
+static int  g_inv_search_len = 0;
+static int  g_inv_cat = 0;              /* 0 = every category */
+static int  g_inv_cursor = 0;           /* index into the filtered list */
+static uint16_t g_inv_list[ITEM_COUNT];
+static int  g_inv_count = 0;
+
+static int ascii_lower(int c) { return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c; }
+
+/* Case-insensitive substring test, so "oak pl" finds "Dark Oak Planks". */
+static int name_matches(const char *name, const char *needle) {
+    if (!needle[0]) return 1;
+    for (const char *s = name; *s; s++) {
+        const char *a = s, *b = needle;
+        while (*a && *b && ascii_lower((unsigned char)*a) == ascii_lower((unsigned char)*b)) {
+            a++; b++;
+        }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static void inv_refilter(void) {
+    g_inv_count = 0;
+    for (int id = 1; id < ITEM_COUNT; id++) {
+        if (g_items[id].flags & IF_HIDDEN) continue;
+        if (g_inv_cat && g_items[id].category != g_inv_cat) continue;
+        if (!name_matches(item_name(id), g_inv_search)) continue;
+        g_inv_list[g_inv_count++] = (uint16_t)id;
+    }
+    if (g_inv_cursor >= g_inv_count) g_inv_cursor = g_inv_count ? g_inv_count - 1 : 0;
+}
+
+static const char *const g_cat_names[CAT_COUNT] = {
+    "Engine", "Items", "Potions", "Enchanted Books", "Smithing Templates",
+    "Pottery"
+};
+
+static void fill_rect(int x, int y, int w, int h, uint32_t c) {
+    for (int py = y; py < y + h; py++) {
+        if (py < 0 || py >= g_rh) continue;
+        for (int px = x; px < x + w; px++) {
+            if (px < 0 || px >= g_rw) continue;
+            g_framebuf[py * g_rw + px] = c;
+        }
+    }
+}
+
+/* Blends a colour over a rectangle, for the inventory's dimmed backdrop. */
+static void shade_rect(int x, int y, int w, int h, float f) {
+    for (int py = y; py < y + h; py++) {
+        if (py < 0 || py >= g_rh) continue;
+        for (int px = x; px < x + w; px++) {
+            if (px < 0 || px >= g_rw) continue;
+            g_framebuf[py * g_rw + px] = col_shade(g_framebuf[py * g_rw + px], f);
+        }
+    }
+}
+
+static void render_inventory(void) {
+    const int rw = g_rw, rh = g_rh;
+    shade_rect(0, 0, rw, rh, 0.35f);
+
+    int cell = rw / (INV_COLS + 3);
+    if (cell < 10) cell = 10;
+    if (cell > 34) cell = 34;
+    int gap = cell / 8 + 1;
+    int gw = INV_COLS * (cell + gap) - gap;
+    int gh = INV_ROWS * (cell + gap) - gap;
+    int x0 = (rw - gw) / 2, y0 = (rh - gh) / 2 + cell / 2;
+    int sc = (rw >= 380) ? 2 : 1;
+
+    fill_rect(x0 - 6, y0 - cell - 6, gw + 12, gh + cell + 12, 0xff1b1b20u);
+    fill_rect(x0 - 4, y0 - cell - 4, gw + 8, gh + cell + 8, 0xff2c2c34u);
+
+    int page = g_inv_count ? g_inv_cursor / INV_PAGE : 0;
+    int first = page * INV_PAGE;
+
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "%s  [%d]  page %d/%d",
+             g_cat_names[g_inv_cat], g_inv_count, page + 1,
+             g_inv_count ? (g_inv_count + INV_PAGE - 1) / INV_PAGE : 1);
+    font_text(g_framebuf, rw, rh, x0, y0 - cell + 1, hdr, 0xffe8e8f0u, sc);
+
+    char search[40];
+    snprintf(search, sizeof search, "find: %s_", g_inv_search);
+    font_text(g_framebuf, rw, rh, x0, y0 - cell + 10 * sc, search,
+              0xffa8d8ffu, sc);
+
+    for (int i = 0; i < INV_PAGE; i++) {
+        int idx = first + i;
+        if (idx >= g_inv_count) break;
+        int item = g_inv_list[idx];
+        int cx = x0 + (i % INV_COLS) * (cell + gap);
+        int cy = y0 + (i / INV_COLS) * (cell + gap);
+        int sel = (idx == g_inv_cursor);
+        fill_rect(cx, cy, cell, cell, sel ? 0xff5a5a70u : 0xff3a3a44u);
+        draw_item_ortho(g_framebuf, rw, rh, cx, cy, cell, item, NULL,
+                        g_tex_phase, sel ? 1.15f : 1.0f);
+    }
+
+    if (g_inv_count) {
+        const char *nm = item_name(g_inv_list[g_inv_cursor]);
+        int tw = font_width(nm, sc);
+        font_text(g_framebuf, rw, rh, (rw - tw) / 2, y0 + gh + 4, nm,
+                  0xffffffffu, sc);
+    } else {
+        font_text(g_framebuf, rw, rh, x0, y0 + 4, "no match", 0xffff8080u, sc);
+    }
+    font_text(g_framebuf, rw, rh, x0, y0 + gh + 6 + 9 * sc,
+              "arrows move  enter take  tab category  esc close",
+              0xff9090a0u, 1);
+}
+
+/* ----------------------------------------------------------------------- */
+/* Overlay: crosshair, held item, hotbar                                    */
+/* ----------------------------------------------------------------------- */
+
+/* The pose of whatever is in the player's hand: its looping idle clip, plus
+   any one-shot use clip still playing. */
+static void held_pose(int item, Pose *out) {
+    Pose idle, use;
+    anim_pose(item_def(item)->anim_idle, g_time, &idle);
+    if (g_use_clip != ANIM_NONE && g_use_time < anim_length(g_use_clip)) {
+        anim_pose(g_use_clip, g_use_time, &use);
+        anim_blend(&idle, &use, out);
+    } else {
+        *out = idle;
+    }
+}
+
+static void render_held_item(void) {
+    int item = g_selected;
+    if (item <= IT_AIR) return;
+    int size = g_rw / 5;
+    if (size > ICON_MAX) size = ICON_MAX;
+    if (size < 12) return;
+    Pose p;
+    held_pose(item, &p);
+    /* pushed to the lower right, the way a first-person hand sits */
+    int x = g_rw - size - g_rw / 24;
+    int y = g_rh - size - g_rh / 12;
+    float bright = item_light(item) ? 1.3f : 1.05f;
+    draw_item_ortho(g_framebuf, g_rw, g_rh, x, y, size, item, &p,
+                    g_tex_phase, bright);
+}
+
+/* Draws the crosshair, the held item and the hotbar over the finished frame. */
 static void render_overlay(void) {
     const int rw = g_rw, rh = g_rh;
 
@@ -757,26 +1084,34 @@ static void render_overlay(void) {
         g_framebuf[(cyp + i) * rw + cxp] ^= 0x00ffffff;
     }
 
-    /* hotbar: block ids 1..10 (GLASS = 10), selected slot highlighted */
-    const int slots = 10, gap = 2;
+    render_held_item();
+
+    const int gap = 2;
     int sw = 22 * rw / RENDER_W; if (sw < 8) sw = 8;   /* scale with render size */
-    int tot = slots * (sw + gap) - gap;
+    int tot = HOTBAR_SLOTS * (sw + gap) - gap;
     int x0 = (rw - tot) / 2, y0 = rh - sw - 6;
-    for (int k = 0; k < slots; k++) {
-        int blk = k + 1;
+    for (int k = 0; k < HOTBAR_SLOTS; k++) {
+        int item = g_hotbar[k];
         int sxp = x0 + k * (sw + gap);
-        int sel = (blk == g_selected);
-        for (int yy = -2; yy < sw + 2; yy++)
-            for (int xx = -2; xx < sw + 2; xx++) {
-                int px = sxp + xx, py = y0 + yy;
-                if (px < 0 || px >= rw || py < 0 || py >= rh) continue;
-                if (xx < 0 || yy < 0 || xx >= sw || yy >= sw)
-                    g_framebuf[py * rw + px] = sel ? 0xffffffffu : 0xff202020u;
-                else
-                    g_framebuf[py * rw + px] =
-                        g_tex[blk][1][(yy * TEX / sw) * TEX + (xx * TEX / sw)];
-            }
+        int sel = (k == g_slot);
+        fill_rect(sxp - 2, y0 - 2, sw + 4, sw + 4,
+                  sel ? 0xffffffffu : 0xff202020u);
+        fill_rect(sxp, y0, sw, sw, 0xff3a3a44u);
+        if (item > IT_AIR)
+            draw_item_ortho(g_framebuf, rw, rh, sxp, y0, sw, item, NULL,
+                            g_tex_phase, 1.0f);
     }
+
+    /* name of the held item, above the bar */
+    if (g_selected > IT_AIR) {
+        int sc = (rw >= 380) ? 2 : 1;
+        const char *nm = item_name(g_selected);
+        int tw = font_width(nm, sc);
+        font_text(g_framebuf, rw, rh, (rw - tw) / 2, y0 - 9 * sc - 2, nm,
+                  0xffffffffu, sc);
+    }
+
+    if (g_inv_open) render_inventory();
 }
 
 /* ----- adaptive resolution ------------------------------------------------
@@ -883,11 +1218,13 @@ static void render_frame(void) {
         for (int i = 1; i < g_nthreads; i++) SetEvent(g_ev_start[i]);
         render_rows(0, g_nthreads);
         WaitForMultipleObjects(g_nthreads - 1, &g_ev_done[1], TRUE, INFINITE);
+        render_drops();
         render_overlay();
         return;
     }
 #endif
     render_rows(0, 1);
+    render_drops();
     render_overlay();
 }
 
@@ -899,14 +1236,25 @@ static const float PLR_RAD = 0.3f;
 static const float PLR_HEAD = 0.2f;
 static const float PLR_FEET = 1.6f;
 
+/* The player's box against the world. Cells whose model is not a full cube
+   are tested box by box, so a slab is half a step up and you can walk through
+   a flower. */
 static int collide(float ex, float ey, float ez) {
-    int x0 = (int)floorf(ex - PLR_RAD), x1 = (int)floorf(ex + PLR_RAD);
-    int y0 = (int)floorf(ey - PLR_FEET), y1 = (int)floorf(ey + PLR_HEAD);
-    int z0 = (int)floorf(ez - PLR_RAD), z1 = (int)floorf(ez + PLR_RAD);
+    float bx0 = ex - PLR_RAD, bx1 = ex + PLR_RAD;
+    float by0 = ey - PLR_FEET, by1 = ey + PLR_HEAD;
+    float bz0 = ez - PLR_RAD, bz1 = ez + PLR_RAD;
+    int x0 = (int)floorf(bx0), x1 = (int)floorf(bx1);
+    int y0 = (int)floorf(by0), y1 = (int)floorf(by1);
+    int z0 = (int)floorf(bz0), z1 = (int)floorf(bz1);
     for (int x = x0; x <= x1; x++)
         for (int y = y0; y <= y1; y++)
-            for (int z = z0; z <= z1; z++)
-                if (is_solid(x, y, z)) return 1;
+            for (int z = z0; z <= z1; z++) {
+                int blk = get_block(x, y, z);
+                if (!item_is_solid(blk)) continue;
+                if (item_is_full_cube(blk)) return 1;
+                if (model_overlaps(blk, x, y, z, bx0, by0, bz0, bx1, by1, bz1))
+                    return 1;
+            }
     return 0;
 }
 
@@ -949,29 +1297,40 @@ static void update_player(float dt) {
     if (g_py < -40) { g_py = 60; g_vy = 0; }  /* fell out: reset height */
 }
 
+/* Starts the one-shot clip an item plays when it is used. */
+static void play_use_anim(int clip) {
+    g_use_clip = clip;
+    g_use_time = 0.0f;
+}
+
 static void do_break(void) {
     V3 f, r, u; camera_basis(&f, &r, &u);
     int hx, hy, hz, nx, ny, nz, blk; float d;
+    play_use_anim(ANIM_SWING);
     if (raycast(g_px, g_py, g_pz, f.x, f.y, f.z, REACH,
-                &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk))
-        set_block(hx, hy, hz, B_AIR);
+                &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk)) {
+        set_block(hx, hy, hz, IT_AIR);
+        drop_spawn(blk, hx + 0.5f, hy + 0.5f, hz + 0.5f);
+    }
 }
 
 static void do_place(void) {
     V3 f, r, u; camera_basis(&f, &r, &u);
     int hx, hy, hz, nx, ny, nz, blk; float d;
+    int item = g_selected;
+    /* Non-placeable entries (a sword, a potion, an enchanted book) still play
+       their use animation -- they just leave the world alone. */
+    play_use_anim(item_def(item)->anim_use);
+    if (!item_is_placeable(item)) return;
+
     if (raycast(g_px, g_py, g_pz, f.x, f.y, f.z, REACH,
                 &hx, &hy, &hz, &nx, &ny, &nz, &d, &blk)) {
         int bx = hx + nx, by = hy + ny, bz = hz + nz;
-        /* don't place inside the player */
-        float ex = bx + 0.5f, ey = by + 0.5f, ez = bz + 0.5f;
-        int px0 = (int)floorf(g_px - PLR_RAD), px1 = (int)floorf(g_px + PLR_RAD);
-        int py0 = (int)floorf(g_py - PLR_FEET), py1 = (int)floorf(g_py + PLR_HEAD);
-        int pz0 = (int)floorf(g_pz - PLR_RAD), pz1 = (int)floorf(g_pz + PLR_RAD);
-        (void)ex; (void)ey; (void)ez;
-        int inside = (bx >= px0 && bx <= px1 && by >= py0 && by <= py1 && bz >= pz0 && bz <= pz1);
-        if (!inside && get_block(bx, by, bz) == B_AIR)
-            set_block(bx, by, bz, (uint8_t)g_selected);
+        if (get_block(bx, by, bz) != IT_AIR) return;
+        set_block(bx, by, bz, (uint16_t)item);
+        /* A model with no collision (a torch, a flower) can share a cell with
+           the player; anything solid must not be placed inside them. */
+        if (collide(g_px, g_py, g_pz)) set_block(bx, by, bz, IT_AIR);
     }
 }
 
