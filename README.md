@@ -28,7 +28,41 @@ no runtime, no DLLs to copy.** Just double-click the `.exe`.
 - Break and place blocks; 11 block types with a hotbar
 - **World save/load** — persist and resume your world (`world.sav`)
 - Software raycasting renderer with per-face lighting and distance fog
+- Multi-threaded rendering with adaptive resolution (see [Performance](#performance))
 - Runs on old hardware — no GPU or OpenGL required
+
+## Performance
+
+Everything you see is raycast on the CPU, one ray per pixel, so the renderer
+is the entire frame budget. Four things keep it fast:
+
+- **Rays are clipped to the world box.** A ray aimed at the sky used to step
+  its way to the 96-block draw distance finding nothing. Now it stops at the
+  world boundary.
+- **Empty space is skipped in bulk.** A coarse occupancy grid marks 8×8×8
+  macro cells that contain no solid block, and the traversal jumps over runs
+  of them a macro cell at a time instead of one block at a time.
+- **Scanlines are split across worker threads**, one per logical core (rows
+  are interleaved so no thread gets all the cheap ground rows). Threads are
+  created once at startup and parked on an event between frames.
+- **Adaptive resolution.** The game measures its own frame time and lowers the
+  internal render resolution if it can't hold ~45 FPS, raising it again when
+  there's headroom. The frame is upscaled to the window either way, so this
+  costs sharpness rather than field of view. Press `T` to lock it.
+
+Measured on a 4-core machine at the default 480×270 internal resolution:
+
+| Camera | Before | After | |
+|--------|--------|-------|-|
+| Looking down at terrain | 72 FPS | 204 FPS | 2.8× |
+| Horizon | 35 FPS | 172 FPS | 4.9× |
+| Looking up | 21 FPS | 193 FPS | 9.3× |
+| Straight up at open sky | 16 FPS | 222 FPS | 13.7× |
+| **Average** | **26 FPS** | **196 FPS** | **7.5×** |
+
+The gain is largest exactly where the old renderer was worst — the more sky in
+frame, the more the old one stalled — so frame time is now roughly flat
+regardless of where you look, instead of collapsing when you glance upward.
 
 ## Textures / assets
 
@@ -66,7 +100,12 @@ procedurally generated texture for that block, so it always runs.
 | `1`–`9`, `0` | Select block to place (hotbar) |
 | `K` / `L` | Save / load the world (`world.sav`) |
 | `R` | Regenerate the world |
+| `T` | Toggle adaptive resolution |
+| `+` / `-` | Raise / lower render resolution (locks it) |
 | `Esc` | Quit |
+
+The title bar shows the current frame rate, internal render resolution and
+render thread count.
 
 A saved world (`world.sav`) is written next to the game and is loaded
 automatically on the next launch.
